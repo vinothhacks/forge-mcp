@@ -1,0 +1,33 @@
+{
+  "name": "@forge-mcp/server",
+  "version": "0.1.0",
+  "description": "Forge Codebase Search and Intelligence MCP Server — local stdio and self-hosted HTTP wrapper",
+  "main": "./index.js",
+  "bin": {
+    "forge-mcp": "./bin/forge-mcp.js"
+  },
+  "files": [
+    "bin/",
+    "index.js",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node ./bin/forge-mcp.js",
+    "test": "node --test ./test/e2e.test.js",
+    "build:rust": "cargo build --release --manifest-path ../Cargo.toml"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "codebase-search",
+    "code-intelligence",
+    "tree-sitter",
+    "rust",
+    "forge"
+  ],
+  "author": "Forge Contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,12 @@
+﻿/target/
+/.forge/
+*.db
+*.db-journal
+*.db-wal
+node_modules/
+npm/bin/native/
+.env
+.rocketride/
+.serena/
+*.tgz
+.DS_Store
