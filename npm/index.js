@@ -5,6 +5,16 @@ const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const readline = require('node:readline');
 const { EventEmitter } = require('node:events');
+const { getTargetTriple, getCachedBinaryPath } = require('./lib/platform.js');
+const { downloadBinary } = require('./lib/download.js');
+
+const PACKAGE_VERSION = require('./package.json').version;
+
+function isTruthyEnv(value) {
+  if (value === undefined || value === null) return false;
+  const v = String(value).trim().toLowerCase();
+  return v !== '' && v !== '0' && v !== 'false' && v !== 'no';
+}
 
 /**
  * Returns the platform-specific executable name for Forge MCP.
@@ -56,8 +66,12 @@ function findBinaryInPath(binName, env = process.env, platform = process.platfor
  * 1) `FORGE_MCP_BIN` environment variable (or `options.binPath`)
  * 2) Bundled `npm/bin/native/forge-mcp[.exe]`
  * 3) Workspace `target/release/forge-mcp[.exe]` or `target/debug/forge-mcp[.exe]`
- * 4) System `PATH`
- * 5) If not found and `Cargo.toml` exists in the parent workspace directory,
+ * 4) Previously downloaded release binary in the cache (`~/.forge-mcp/bin/<version>/<target>/`)
+ * 5) System `PATH`
+ * 6) Download the matching release binary from GitHub Releases, verify it against
+ *    `SHA256SUMS`, and cache it (skipped when `FORGE_MCP_SKIP_DOWNLOAD` is set or
+ *    `options.autoDownload === false`)
+ * 7) If not found and `Cargo.toml` exists in the parent workspace directory,
  *    automatically builds with `cargo build --release` (emitting all build logs
  *    to `stderr` so `stdio` JSON-RPC `stdout` is never polluted).
  *
@@ -68,6 +82,8 @@ function findBinaryInPath(binName, env = process.env, platform = process.platfor
  * @param {string} [options.packageRoot] Path to `npm/` directory
  * @param {string} [options.workspaceRoot] Path to Rust workspace root directory
  * @param {boolean} [options.autoBuild=true] Whether to run `cargo build --release` if missing
+ * @param {boolean} [options.autoDownload=true] Whether to download a release binary if missing
+ * @param {string} [options.version] Release version to download (defaults to this package's version)
  * @param {boolean} [options.mustExist=false] Whether an explicit `FORGE_MCP_BIN` path must exist on disk
  * @param {NodeJS.WritableStream} [options.stderr=process.stderr] Stream for build logs
  * @returns {string} Absolute path to the resolved binary
@@ -112,13 +128,46 @@ function resolveBinaryPath(options = {}) {
     return path.resolve(debugCandidate);
   }
 
-  // 4) System PATH
+  // 4) Previously downloaded release binary
+  const version = options.version || PACKAGE_VERSION;
+  let cachedCandidate = null;
+  try {
+    cachedCandidate = getCachedBinaryPath({ version, platform, env });
+  } catch (_) {
+    // Unsupported platform: no prebuilt binary exists, continue with PATH / cargo
+  }
+  if (cachedCandidate && fs.existsSync(cachedCandidate) && fs.statSync(cachedCandidate).isFile()) {
+    return cachedCandidate;
+  }
+
+  // 5) System PATH
   const pathCandidate = findBinaryInPath(binName, env, platform);
   if (pathCandidate) {
     return pathCandidate;
   }
 
-  // 5) Automatic cargo build --release if Cargo.toml exists in parent directory
+  // 6) Download the release binary (synchronously, via a child node process)
+  const skipDownload = isTruthyEnv(env.FORGE_MCP_SKIP_DOWNLOAD) || options.autoDownload === false;
+  if (!skipDownload && cachedCandidate) {
+    const dl = spawnSync(
+      process.execPath,
+      [path.join(__dirname, 'lib', 'download.js'), '--version', version, '--dest', cachedCandidate],
+      {
+        env: { ...process.env, ...env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true
+      }
+    );
+    if (stderr && typeof stderr.write === 'function') {
+      if (dl.stdout && dl.stdout.length > 0) stderr.write(dl.stdout);
+      if (dl.stderr && dl.stderr.length > 0) stderr.write(dl.stderr);
+    }
+    if (dl.status === 0 && fs.existsSync(cachedCandidate)) {
+      return cachedCandidate;
+    }
+  }
+
+  // 7) Automatic cargo build --release if Cargo.toml exists in parent directory
   const cargoTomlPath = path.join(workspaceRoot, 'Cargo.toml');
   if (autoBuild && fs.existsSync(cargoTomlPath)) {
     if (stderr && typeof stderr.write === 'function') {
@@ -155,7 +204,10 @@ function resolveBinaryPath(options = {}) {
   }
 
   throw new Error(
-    `Unable to locate "${binName}". Checked FORGE_MCP_BIN, ${bundledCandidate}, ${releaseCandidate}, ${debugCandidate}, and system PATH.`
+    `Unable to locate "${binName}". Checked FORGE_MCP_BIN, ${bundledCandidate}, ${releaseCandidate}, ${debugCandidate}, ` +
+      `${cachedCandidate || 'the download cache (unsupported platform)'}, and system PATH` +
+      (skipDownload ? ' (download skipped: FORGE_MCP_SKIP_DOWNLOAD or autoDownload:false).' : '; the release download did not succeed.') +
+      ' Install with "cargo install forge-mcp --locked" or set FORGE_MCP_BIN.'
   );
 }
 
@@ -243,14 +295,23 @@ function normalizeToolResult(result) {
           return Object.assign({}, parsed, result, { envelope: parsed });
         }
       } catch (_) {
-        // Non-JSON text block; return result as-is
+        // Non-JSON text block; fall back to structuredContent below
       }
     }
-    if (result.structuredContent && typeof result.structuredContent === 'object') {
-      return Object.assign({}, result.structuredContent, result, {
-        envelope: result.structuredContent
-      });
-    }
+  }
+
+  // Servers may carry the envelope only in `structuredContent` (with or without `content`)
+  if (
+    result.structuredContent &&
+    typeof result.structuredContent === 'object' &&
+    !Array.isArray(result.structuredContent)
+  ) {
+    return Object.assign({}, result.structuredContent, result, {
+      envelope: result.structuredContent
+    });
+  }
+
+  if (Array.isArray(result.content)) {
     return result;
   }
 
@@ -343,6 +404,8 @@ class ForgeMcpClient extends EventEmitter {
    * @param {Record<string, string>} [options.headers] Additional HTTP headers
    * @param {number} [options.timeoutMs=60000] Per-request timeout in milliseconds
    * @param {boolean} [options.inheritStderr=false] Forward child stderr to process.stderr
+   * @param {number} [options.closeGraceMs=1000] How long close() waits for the stdio server to exit
+   *   on stdin EOF before sending SIGTERM (SIGKILL follows 2000 ms later)
    */
   constructor(options = {}) {
     super();
@@ -650,10 +713,10 @@ class ForgeMcpClient extends EventEmitter {
   /**
    * Performs the MCP `initialize` handshake and sends `notifications/initialized`.
    *
-   * @param {object} [clientInfo={ name: '@forge-mcp/client', version: '0.1.0' }]
+   * @param {object} [clientInfo={ name: 'forge-codebase-mcp', version: PACKAGE_VERSION }]
    * @returns {Promise<any>}
    */
-  async initialize(clientInfo = { name: '@forge-mcp/client', version: '0.1.0' }) {
+  async initialize(clientInfo = { name: 'forge-codebase-mcp', version: PACKAGE_VERSION }) {
     const result = await this.request('initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
@@ -752,31 +815,49 @@ class ForgeMcpClient extends EventEmitter {
       const proc = this.child;
       this.child = null;
 
-      if (proc.exitCode === null && !proc.killed) {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        const graceMs =
+          typeof this.options.closeGraceMs === 'number' && this.options.closeGraceMs >= 0
+            ? this.options.closeGraceMs
+            : 1000;
         await new Promise((resolve) => {
-          const killTimer = setTimeout(() => {
+          let termTimer = null;
+          let killTimer = null;
+          const finish = () => {
+            clearTimeout(termTimer);
+            clearTimeout(killTimer);
+            resolve();
+          };
+
+          proc.once('exit', finish);
+
+          // 1) Graceful: close stdin so the server sees EOF, flushes state, and exits on its own
+          try {
+            if (proc.stdin && !proc.stdin.destroyed) {
+              proc.stdin.end();
+            }
+          } catch (_) {
+            // Ignore
+          }
+
+          // 2) SIGTERM if the server is still running after the grace period
+          termTimer = setTimeout(() => {
+            try {
+              proc.kill('SIGTERM');
+            } catch (_) {
+              // Ignore
+            }
+          }, graceMs);
+
+          // 3) SIGKILL as a last resort
+          killTimer = setTimeout(() => {
             try {
               proc.kill('SIGKILL');
             } catch (_) {
               // Ignore
             }
-            resolve();
-          }, 2000);
-
-          proc.once('exit', () => {
-            clearTimeout(killTimer);
-            resolve();
-          });
-
-          try {
-            if (proc.stdin && !proc.stdin.destroyed) {
-              proc.stdin.end();
-            }
-            proc.kill('SIGTERM');
-          } catch (_) {
-            clearTimeout(killTimer);
-            resolve();
-          }
+            finish();
+          }, graceMs + 2000);
         });
       }
     }
@@ -789,5 +870,8 @@ module.exports = {
   resolveBinaryPath,
   spawnForgeServer,
   normalizeToolResult,
+  parseHttpRpcBody,
+  getTargetTriple,
+  downloadBinary,
   ForgeMcpClient
 };

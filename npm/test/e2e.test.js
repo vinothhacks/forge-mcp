@@ -451,9 +451,8 @@ describe('@forge-mcp/server E2E suite', () => {
     assert.equal(fromEnv, path.resolve(customOverride));
     fs.unlinkSync(customOverride);
 
-    resolvedBin = resolveBinaryPath({
-      env: { ...process.env, FORGE_MCP_BIN: '' }
-    });
+    // Honor FORGE_MCP_BIN when set so the suite also runs outside the Rust workspace
+    resolvedBin = resolveBinaryPath({ env: process.env });
     assert.ok(resolvedBin && fs.existsSync(resolvedBin), `Resolved binary must exist: ${resolvedBin}`);
   });
 
@@ -616,5 +615,255 @@ describe('@forge-mcp/server E2E suite', () => {
         }
       }
     }
+  });
+});
+
+describe('@forge-mcp/server offline regressions', () => {
+  const { findBinaryInPath, normalizeToolResult, parseHttpRpcBody } = require('../index.js');
+
+  test('resolveBinaryPath order: explicit > bundled > release > debug > PATH (never builds)', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mcp-resolve-'));
+    const binName = getBinaryName();
+    const npmRoot = path.join(root, 'npmroot');
+    const wsRoot = path.join(root, 'wsroot');
+    const pathDir = path.join(root, 'pathdir');
+    const emptyDir = path.join(root, 'empty');
+    const bundled = path.join(npmRoot, 'bin', 'native', binName);
+    const release = path.join(wsRoot, 'target', 'release', binName);
+    const debug = path.join(wsRoot, 'target', 'debug', binName);
+    const onPath = path.join(pathDir, binName);
+    for (const file of [bundled, release, debug, onPath]) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'stub', 'utf8');
+    }
+    fs.mkdirSync(emptyDir, { recursive: true });
+    // No Cargo.toml + autoBuild:false guarantees the cargo build step is never reached
+    const base = { packageRoot: npmRoot, workspaceRoot: wsRoot, autoBuild: false, env: { PATH: pathDir } };
+
+    try {
+      assert.ok(!fs.existsSync(path.join(wsRoot, 'Cargo.toml')));
+      const explicit = path.join(root, 'explicit', binName);
+      const fromEnv = path.join(root, 'env', binName);
+      assert.equal(resolveBinaryPath({ ...base, binPath: explicit }), path.resolve(explicit));
+      assert.equal(
+        resolveBinaryPath({ ...base, env: { PATH: pathDir, FORGE_MCP_BIN: fromEnv } }),
+        path.resolve(fromEnv)
+      );
+      assert.equal(
+        resolveBinaryPath({ ...base, binPath: explicit, env: { PATH: pathDir, FORGE_MCP_BIN: fromEnv } }),
+        path.resolve(explicit),
+        'binPath option should take precedence over FORGE_MCP_BIN'
+      );
+      assert.equal(resolveBinaryPath(base), path.resolve(bundled));
+      fs.unlinkSync(bundled);
+      assert.equal(resolveBinaryPath(base), path.resolve(release));
+      fs.unlinkSync(release);
+      assert.equal(resolveBinaryPath(base), path.resolve(debug));
+      fs.unlinkSync(debug);
+      assert.equal(resolveBinaryPath(base), path.resolve(onPath));
+
+      assert.throws(
+        () => resolveBinaryPath({ ...base, env: { PATH: emptyDir } }),
+        (err) => {
+          for (const fragment of ['FORGE_MCP_BIN', bundled, release, debug, 'system PATH']) {
+            assert.ok(err.message.includes(fragment), `error should mention ${fragment}: ${err.message}`);
+          }
+          return true;
+        }
+      );
+      assert.throws(
+        () =>
+          resolveBinaryPath({
+            ...base,
+            env: { FORGE_MCP_BIN: path.join(root, 'missing', binName) },
+            mustExist: true
+          }),
+        /non-existent file/
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('findBinaryInPath / getBinaryName honor the platform argument', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mcp-path-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'forge-mcp.exe'), 'stub', 'utf8');
+      assert.equal(
+        findBinaryInPath('forge-mcp', { PATH: dir }, 'win32'),
+        path.resolve(dir, 'forge-mcp.exe')
+      );
+      assert.equal(findBinaryInPath('forge-mcp', { PATH: '' }, 'win32'), null);
+      assert.equal(getBinaryName('linux'), 'forge-mcp');
+      assert.equal(getBinaryName('darwin'), 'forge-mcp');
+      assert.equal(getBinaryName('win32'), 'forge-mcp.exe');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('normalizeToolResult exposes envelope fields for every response shape', () => {
+    const envelope = {
+      snapshot_id: 'snap-1',
+      freshness: 'current',
+      results: [{ workspace_id: 'ws-1' }],
+      evidence: [],
+      limitations: [],
+      truncated: false
+    };
+
+    const fromText = normalizeToolResult({ content: [{ type: 'text', text: JSON.stringify(envelope) }] });
+    assert.equal(fromText.snapshot_id, 'snap-1');
+    assert.equal(fromText.freshness, 'current');
+    assert.deepEqual(fromText.results, envelope.results);
+    assert.deepEqual(fromText.envelope, envelope);
+    assert.ok(Array.isArray(fromText.content));
+
+    // Regression: structuredContent without a content array used to be returned untouched
+    const fromStructured = normalizeToolResult({ structuredContent: envelope });
+    assert.equal(fromStructured.snapshot_id, 'snap-1');
+    assert.equal(fromStructured.freshness, 'current');
+    assert.deepEqual(fromStructured.results, envelope.results);
+    assert.deepEqual(fromStructured.envelope, envelope);
+
+    const fromStructuredWithPlainText = normalizeToolResult({
+      content: [{ type: 'text', text: 'not json' }],
+      structuredContent: envelope
+    });
+    assert.deepEqual(fromStructuredWithPlainText.results, envelope.results);
+
+    const fromRaw = normalizeToolResult(envelope);
+    assert.equal(fromRaw.isError, false);
+    assert.deepEqual(JSON.parse(fromRaw.content[0].text), envelope);
+    assert.deepEqual(fromRaw.envelope, envelope);
+    assert.equal(fromRaw.snapshot_id, 'snap-1');
+
+    const toolError = { isError: true, content: [{ type: 'text', text: 'boom' }] };
+    assert.deepEqual(normalizeToolResult(toolError), toolError);
+
+    const errorWithJson = normalizeToolResult({
+      isError: true,
+      content: [{ type: 'text', text: JSON.stringify({ ...envelope, isError: false }) }]
+    });
+    assert.equal(errorWithJson.isError, true, 'MCP isError must win over envelope fields');
+
+    assert.equal(normalizeToolResult(null), null);
+    assert.equal(normalizeToolResult('text'), 'text');
+  });
+
+  test('parseHttpRpcBody handles JSON and text/event-stream bodies', () => {
+    assert.deepEqual(parseHttpRpcBody('', 'application/json'), {});
+    assert.deepEqual(
+      parseHttpRpcBody('{"jsonrpc":"2.0","id":1,"result":{"ok":true}}', 'application/json', 1),
+      { jsonrpc: '2.0', id: 1, result: { ok: true } }
+    );
+
+    const sse = [
+      'event: message',
+      'data: {"jsonrpc":"2.0","id":99,"result":{"decoy":true}}',
+      '',
+      'event: message',
+      'data: {"jsonrpc":"2.0","id":2,"result":{"ok":true}}',
+      '',
+      'data: [DONE]',
+      ''
+    ].join('\n');
+    assert.deepEqual(parseHttpRpcBody(sse, 'text/event-stream', 2).result, { ok: true });
+    assert.deepEqual(parseHttpRpcBody(sse, 'text/event-stream').result, { ok: true });
+
+    // CRLF framing, no event: line, no content-type: detected from the data: prefix
+    const crlf = 'data: {"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"boom"}}\r\n\r\n';
+    assert.deepEqual(parseHttpRpcBody(crlf, '', 3).error, { code: -32000, message: 'boom' });
+  });
+
+  describe('ForgeMcpClient.close() terminates the stdio child', () => {
+    let scriptDir;
+    const writeFakeServer = (name, exitOnEof) => {
+      const file = path.join(scriptDir, name);
+      fs.writeFileSync(
+        file,
+        [
+          "const rl = require('node:readline').createInterface({ input: process.stdin });",
+          "rl.on('line', (line) => {",
+          '  const msg = JSON.parse(line);',
+          '  if (msg.id !== undefined) {',
+          "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { serverInfo: { name: 'fake', version: '0' } } }) + '\\n');",
+          '  }',
+          '});',
+          exitOnEof ? "rl.on('close', () => process.exit(0));" : 'setInterval(() => {}, 1000);',
+          ''
+        ].join('\n'),
+        'utf8'
+      );
+      return file;
+    };
+
+    before(() => {
+      scriptDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mcp-close-'));
+    });
+
+    after(() => {
+      fs.rmSync(scriptDir, { recursive: true, force: true });
+    });
+
+    test('graceful: child exits with code 0 on stdin EOF', async () => {
+      const script = writeFakeServer('graceful.js', true);
+      const client = new ForgeMcpClient({ transport: 'stdio', binPath: process.execPath, args: [script] });
+      await client.initialize();
+      const child = client.child;
+      const started = Date.now();
+      await client.close();
+      assert.ok(Date.now() - started < 3000, 'close() should finish within 3 s');
+      assert.equal(child.exitCode, 0);
+      await assert.rejects(() => client.request('tools/list'), /closed/);
+    });
+
+    test('stubborn: child ignoring stdin EOF is terminated by signal', async () => {
+      const script = writeFakeServer('stubborn.js', false);
+      const client = new ForgeMcpClient({
+        transport: 'stdio',
+        binPath: process.execPath,
+        args: [script],
+        closeGraceMs: 200
+      });
+      await client.initialize();
+      const child = client.child;
+      const started = Date.now();
+      await client.close();
+      assert.ok(Date.now() - started < 3000, 'close() should finish within 3 s');
+      assert.ok(child.exitCode !== null || child.signalCode !== null, 'child must have exited');
+    });
+
+    test('real forge-mcp binary exits with code 0 on close()', async (t) => {
+      let binPath;
+      try {
+        binPath = resolveBinaryPath({ autoBuild: false, mustExist: true });
+      } catch (_) {
+        t.skip('forge-mcp binary not available (set FORGE_MCP_BIN)');
+        return;
+      }
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mcp-close-real-'));
+      const client = new ForgeMcpClient({
+        transport: 'stdio',
+        binPath,
+        allowRoot: root,
+        dbPath: path.join(root, 'forge.db')
+      });
+      try {
+        await client.initialize();
+        const child = client.child;
+        const started = Date.now();
+        await client.close();
+        assert.ok(Date.now() - started < 3000, 'close() should finish within 3 s');
+        assert.equal(child.exitCode, 0);
+      } finally {
+        await client.close();
+        try {
+          fs.rmSync(root, { recursive: true, force: true });
+        } catch (_) {
+          // Ignore locked temp files on Windows
+        }
+      }
+    });
   });
 });

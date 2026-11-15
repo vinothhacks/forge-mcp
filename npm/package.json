@@ -1,19 +1,20 @@
 {
-  "name": "@forge-mcp/server",
+  "name": "forge-codebase-mcp",
   "version": "0.1.0",
-  "description": "Forge Codebase Search and Intelligence MCP Server — local stdio and self-hosted HTTP wrapper",
+  "description": "Forge: self-hosted codebase search and code-intelligence MCP server for coding agents (stdio and HTTP)",
   "main": "./index.js",
   "bin": {
     "forge-mcp": "./bin/forge-mcp.js"
   },
   "files": [
     "bin/",
+    "lib/",
     "index.js",
     "README.md"
   ],
   "scripts": {
     "start": "node ./bin/forge-mcp.js",
-    "test": "node --test ./test/e2e.test.js",
+    "test": "node --test ./test/e2e.test.js ./test/download.test.js",
     "build:rust": "cargo build --release --manifest-path ../Cargo.toml"
   },
   "keywords": [
@@ -22,11 +23,25 @@
     "codebase-search",
     "code-intelligence",
     "tree-sitter",
+    "coding-agent",
     "rust",
     "forge"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vinothhacks/forge-mcp.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/vinothhacks/forge-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/vinothhacks/forge-mcp/issues"
+  },
   "author": "Forge Contributors",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "engines": {
     "node": ">=18.0.0"
   }

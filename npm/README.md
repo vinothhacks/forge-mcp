@@ -1,15 +1,15 @@
-# `@forge-mcp/server`
+# `forge-codebase-mcp`
 
 Node.js CLI wrapper and programmatic SDK for the **Forge Codebase Search and Intelligence MCP Server**.
 
-`@forge-mcp/server` requires **Node.js >= 18.0.0** and has **zero external runtime dependencies**.
+`forge-codebase-mcp` requires **Node.js >= 18.0.0** and has **zero external runtime dependencies**.
 
 ---
 
 ## Features
 
-- **Seamless CLI Launcher (`forge-mcp`)**: Resolves or builds the native Rust `forge-mcp` binary and forwards all CLI flags, environment variables, `stdio` streams, and signals (`SIGINT`, `SIGTERM`).
-- **Local `stdio` Transport**: Launch directly from Cursor, Claude Desktop, OpenCode, or any MCP host via `npx @forge-mcp/server`.
+- **Seamless CLI Launcher (`forge-mcp`)**: Resolves, downloads, or builds the native Rust `forge-mcp` binary and forwards all CLI flags, environment variables, `stdio` streams, and signals (`SIGINT`, `SIGTERM`).
+- **Local `stdio` Transport**: Launch directly from Cursor, Claude Desktop, OpenCode, or any MCP host via `npx forge-codebase-mcp`.
 - **Self-Hosted `http` Transport**: Run a multi-workspace HTTP JSON-RPC server with optional Bearer token authentication and canonicalized workspace root allowlists.
 - **Programmatic Node.js Client (`ForgeMcpClient`)**: Built-in client supporting both `stdio` and `http` transports with helpers for `initialize()`, `listTools()`, `callTool()`, and `close()`.
 
@@ -28,7 +28,7 @@ Add Forge to your MCP configuration (e.g. `.cursor/mcp.json` or `claude_desktop_
       "command": "npx",
       "args": [
         "-y",
-        "@forge-mcp/server",
+        "forge-codebase-mcp",
         "--transport",
         "stdio",
         "--allow-root",
@@ -52,7 +52,7 @@ node ./npm/bin/forge-mcp.js --transport stdio --allow-root /path/to/your/workspa
 Start the Forge HTTP server with Bearer authentication and an allowlisted workspace root:
 
 ```bash
-npx @forge-mcp/server \
+npx forge-codebase-mcp \
   --transport http \
   --host 0.0.0.0 \
   --port 8080 \
@@ -73,8 +73,12 @@ When `forge-mcp` or `resolveBinaryPath()` runs, it locates `forge-mcp` (or `forg
 1. `FORGE_MCP_BIN` environment variable (if set)
 2. Bundled binary at `npm/bin/native/forge-mcp[.exe]`
 3. Workspace build output at `target/release/forge-mcp[.exe]` or `target/debug/forge-mcp[.exe]`
-4. System `PATH`
-5. Automatic source build via `cargo build --release` if `Cargo.toml` exists in the parent directory (all compiler output is directed to `stderr` so `stdio` JSON-RPC `stdout` is never polluted)
+4. A previously downloaded release binary in `~/.forge-mcp/bin/<version>/<target>/` (override with `FORGE_MCP_CACHE_DIR`)
+5. System `PATH`
+6. Download the matching binary from [GitHub Releases](https://github.com/vinothhacks/forge-mcp/releases), verify it against the release `SHA256SUMS`, and cache it. Set `FORGE_MCP_SKIP_DOWNLOAD=1` to disable; `FORGE_MCP_RELEASE_BASE_URL` and `FORGE_MCP_RELEASE_TAG` point it at a mirror or another release.
+7. Automatic source build via `cargo build --release` if `Cargo.toml` exists in the parent directory (all compiler output is directed to `stderr` so `stdio` JSON-RPC `stdout` is never polluted)
+
+Prebuilt binaries exist for Windows x64, Linux x64/arm64 and macOS x64/arm64. On other platforms, install with `cargo install forge-mcp --locked`.
 
 ---
 
@@ -85,7 +89,7 @@ const {
   resolveBinaryPath,
   spawnForgeServer,
   ForgeMcpClient
-} = require('@forge-mcp/server');
+} = require('forge-codebase-mcp');
 
 // 1. Resolve native binary path
 const binPath = resolveBinaryPath();
