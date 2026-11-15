@@ -26,7 +26,11 @@ if (cargoVersion !== npmVersion) {
 const ref = process.env.GITHUB_REF_NAME || '';
 if (/^v\d/.test(ref)) {
   const tagVersion = ref.slice(1);
-  if (tagVersion !== cargoVersion) {
+  // A pre-release tag such as v0.1.0-rc.1 rehearses the release of 0.1.0:
+  // it builds binaries and a GitHub pre-release but publishes nothing to registries.
+  const tagBase = tagVersion.split('-')[0];
+  const isPrerelease = tagVersion.includes('-');
+  if (tagVersion !== cargoVersion && !(isPrerelease && tagBase === cargoVersion)) {
     problems.push(`tag ${ref} does not match Cargo.toml version ${cargoVersion}`);
   }
 }
