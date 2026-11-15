@@ -17,9 +17,11 @@ pub fn detect_language(path: &Path) -> Option<&'static str> {
     match ext.as_str() {
         "rs" => Some("rust"),
         "ts" => Some("typescript"),
-        "tsx" => Some("tsx"),
-        "js" | "mjs" | "cjs" => Some("javascript"),
-        "jsx" => Some("jsx"),
+        // TSX/JSX are reported under their family language so language filters
+        // ("typescript", "javascript") match them; the TSX grammar is still chosen
+        // from the file extension in grammar_key().
+        "tsx" => Some("typescript"),
+        "js" | "mjs" | "cjs" | "jsx" => Some("javascript"),
         "py" | "pyi" => Some("python"),
         "go" => Some("go"),
         _ => None,
@@ -35,6 +37,21 @@ pub fn get_tree_sitter_language(lang: &str) -> Result<Language> {
         "python" => Ok(Language::from(tree_sitter_python::LANGUAGE)),
         "go" => Ok(Language::from(tree_sitter_go::LANGUAGE)),
         other => Err(anyhow!("Unsupported language for Tree-sitter: {}", other)),
+    }
+}
+
+/// Pick the Tree-sitter grammar key for a file. `.tsx` files are stored as
+/// "typescript" but must be parsed with the TSX grammar to understand JSX.
+fn grammar_key<'a>(language: &'a str, file_path: &str) -> &'a str {
+    let is_tsx = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("tsx"))
+        .unwrap_or(false);
+    if language == "typescript" && is_tsx {
+        "tsx"
+    } else {
+        language
     }
 }
 
@@ -210,7 +227,7 @@ pub fn parse_file_ast(
     content: &str,
     file_hash: &str,
 ) -> Result<ParsedFile> {
-    let ts_lang = get_tree_sitter_language(language)?;
+    let ts_lang = get_tree_sitter_language(grammar_key(language, file_path))?;
     let mut parser = Parser::new();
     parser
         .set_language(&ts_lang)
@@ -822,12 +839,7 @@ impl<'a> WalkContext<'a> {
 
     fn extract_ts_heritage(&mut self, heritage_node: Node<'_>, class_id: &str, class_name: &str) {
         let text = node_text(heritage_node, self.content);
-        for token in text
-            .replace(',', " ")
-            .replace('<', " ")
-            .replace('>', " ")
-            .split_whitespace()
-        {
+        for token in text.replace([',', '<', '>'], " ").split_whitespace() {
             if token == "extends" || token == "implements" {
                 continue;
             }
@@ -1030,13 +1042,15 @@ impl<'a> WalkContext<'a> {
                 if let Some(name) = child_ident_name(node, self.content) {
                     let recv_type = node
                         .child_by_field_name("receiver")
-                        .map(|r| extract_last_identifier(node_text(r, self.content)))
-                        .filter(|s| !s.is_empty());
+                        .and_then(|r| go_receiver_type(r, self.content));
                     let recv_sym_id = recv_type.as_ref().and_then(|rt| {
                         self.out
                             .symbols
                             .iter()
-                            .find(|s| &s.name == rt)
+                            .find(|s| {
+                                &s.name == rt
+                                    && matches!(s.kind, SymbolKind::Struct | SymbolKind::Interface)
+                            })
                             .map(|s| s.symbol_id.clone())
                     });
                     let (id, qname) = self.record_symbol(
@@ -1174,16 +1188,31 @@ impl<'a> WalkContext<'a> {
     }
 }
 
+/// Resolve a Go method receiver such as `(s *St)`, `(St)` or `(s *St[T])` to its
+/// base type name (`St`) rather than the receiver parameter name.
+fn go_receiver_type(receiver: Node<'_>, src: &str) -> Option<String> {
+    let mut cursor = receiver.walk();
+    let param = receiver
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "parameter_declaration")?;
+    let ty = param.child_by_field_name("type")?;
+    let raw = node_text(ty, src).trim().trim_start_matches('*').trim();
+    let base = raw.split('[').next().unwrap_or(raw);
+    let name = extract_last_identifier(base);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 fn extract_last_identifier(raw: &str) -> String {
     let cleaned = raw
         .trim()
         .trim_end_matches('!')
         .trim_end_matches('?')
         .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != ':' && c != '.');
-    let last = cleaned
-        .rsplit(|c| c == ':' || c == '.' || c == '/')
-        .next()
-        .unwrap_or(cleaned);
+    let last = cleaned.rsplit([':', '.', '/']).next().unwrap_or(cleaned);
     last.chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect()

@@ -14,7 +14,7 @@ pub fn graph_query(
         store.check_workspace_freshness(&req.workspace_id)?;
     let eff_kind = req.effective_query_kind();
     let eff_sym_name = req.effective_symbol_name();
-    let qkind = GraphQueryKind::from_str_lossy(eff_kind);
+    let qkind = parse_query_kind(eff_kind)?;
     let max_depth = req.max_depth.unwrap_or(2).clamp(1, 8);
     let limit = req.limit.unwrap_or(100).clamp(1, 500);
 
@@ -237,7 +237,10 @@ pub fn graph_query(
     let mut unresolved_count = 0usize;
 
     for hop in &hops {
-        if hop.relationship.resolution_kind == ResolutionKind::Unresolved {
+        // A hop is unresolved when the extractor flagged it, or when its target
+        // symbol is not present in this snapshot (external module/crate, stdlib, ...).
+        if hop.relationship.resolution_kind == ResolutionKind::Unresolved || hop.to_symbol.is_none()
+        {
             unresolved_count += 1;
         }
         evidence.push(Evidence {
@@ -259,7 +262,7 @@ pub fn graph_query(
     ];
     if unresolved_count > 0 {
         limitations.push(format!(
-            "{} relationship(s) target external or unresolved symbols.",
+            "{} relationship(s) target external or unresolved symbols (target not present in snapshot).",
             unresolved_count
         ));
     }
@@ -291,6 +294,40 @@ pub fn graph_query(
     ))
 }
 
+/// Strict variant of `GraphQueryKind::from_str_lossy`: unknown kinds are an error
+/// instead of silently falling back to `callers`.
+fn parse_query_kind(s: &str) -> Result<GraphQueryKind> {
+    const KNOWN: &[&str] = &[
+        "callers",
+        "caller",
+        "callees",
+        "callee",
+        "calls",
+        "imports",
+        "import",
+        "importers",
+        "importer",
+        "imported_by",
+        "children",
+        "contains",
+        "child",
+        "implements",
+        "inheritance",
+        "inherits",
+        "path",
+        "shortest_path",
+    ];
+    let norm = s.trim().to_ascii_lowercase();
+    if KNOWN.contains(&norm.as_str()) {
+        Ok(GraphQueryKind::from_str_lossy(&norm))
+    } else {
+        Err(anyhow!(
+            "unknown query_kind '{}'; expected one of callers, callees, imports, importers, children, implements, path",
+            s
+        ))
+    }
+}
+
 fn matches_node(
     sym_id: Option<&str>,
     name: &str,
@@ -306,10 +343,7 @@ fn matches_node(
     if frontier_names.contains(name) || frontier_names.contains(file_path) {
         return true;
     }
-    let short = name
-        .rsplit(|c| c == ':' || c == '.' || c == '/')
-        .next()
-        .unwrap_or(name);
+    let short = name.rsplit([':', '.', '/']).next().unwrap_or(name);
     frontier_names.contains(short)
 }
 
@@ -327,10 +361,7 @@ fn matches_target(
     if frontier_names.contains(to_name) {
         return true;
     }
-    let short = to_name
-        .rsplit(|c| c == ':' || c == '.' || c == '/')
-        .next()
-        .unwrap_or(to_name);
+    let short = to_name.rsplit([':', '.', '/']).next().unwrap_or(to_name);
     frontier_names.contains(short)
 }
 
@@ -338,19 +369,66 @@ fn matches_import_target(to_name: &str, frontier_names: &HashSet<String>) -> boo
     if frontier_names.contains(to_name) {
         return true;
     }
+    let modules = import_module_candidates(to_name);
     for f in frontier_names {
-        let stem = f
-            .trim_end_matches(".rs")
-            .trim_end_matches(".ts")
-            .trim_end_matches(".js")
-            .trim_end_matches(".py")
-            .trim_end_matches(".go");
-        let last_seg = stem.rsplit('/').next().unwrap_or(stem);
-        if !last_seg.is_empty() && to_name.contains(last_seg) {
+        let stem = strip_source_ext(f.rsplit('/').next().unwrap_or(f));
+        if !stem.is_empty() && modules.iter().any(|m| m == stem) {
             return true;
         }
     }
     false
+}
+
+const SOURCE_EXTS: &[&str] = &[".rs", ".tsx", ".ts", ".mjs", ".jsx", ".js", ".py", ".go"];
+
+fn strip_source_ext(s: &str) -> &str {
+    for ext in SOURCE_EXTS {
+        if let Some(stripped) = s.strip_suffix(ext) {
+            return stripped;
+        }
+    }
+    s
+}
+
+/// Module names an import specifier may refer to, compared exactly against a file stem.
+/// - Rust paths (`crate::auth::verify`, `super::auth`): every segment after dropping
+///   `crate`/`self`/`super` (the module may be followed by imported item names).
+/// - Path-like specifiers (`./auth_client`, `../lib/auth.js`, `"fmt"`, `pkg.auth`):
+///   only the last segment, after stripping quotes, `./`/`../` prefixes and a source
+///   extension; dotted Python modules use their last dotted component.
+///
+/// Substring matching is deliberately avoided: `auth` must not match `auth_client`.
+fn import_module_candidates(to_name: &str) -> Vec<String> {
+    let spec = to_name
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .replace('\\', "/");
+    if spec.contains("::") {
+        return spec
+            .split("::")
+            .map(|seg| seg.trim_matches(|c: char| c == '{' || c == '}' || c.is_whitespace()))
+            .filter(|seg| !seg.is_empty() && !matches!(*seg, "crate" | "self" | "super" | "*"))
+            .map(|seg| seg.to_string())
+            .collect();
+    }
+    let mut rest = spec.as_str();
+    loop {
+        if let Some(r) = rest.strip_prefix("./") {
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("../") {
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    let last = rest.rsplit('/').next().unwrap_or(rest);
+    let last = strip_source_ext(last);
+    let last = last.rsplit('.').next().unwrap_or(last);
+    if last.is_empty() {
+        Vec::new()
+    } else {
+        vec![last.to_string()]
+    }
 }
 
 fn bfs_shortest_path(
@@ -401,7 +479,7 @@ fn bfs_shortest_path(
                     || rel.to_name == target_name
                     || rel
                         .to_name
-                        .rsplit(|c| c == ':' || c == '.')
+                        .rsplit([':', '.'])
                         .next()
                         .unwrap_or(&rel.to_name)
                         == target_name;
@@ -491,6 +569,12 @@ pub fn impact_analyze(
             frontier_ids.insert(sym.symbol_id.clone());
             frontier_names.insert(sym.name.clone());
         }
+    } else if let Some(sid) = req.symbol_id.as_deref() {
+        return Err(anyhow!(
+            "symbol_id {:?} not found in snapshot {} for impact_analyze; pass a current symbol_id (from symbol_find) or a symbol_name/file_path",
+            sid,
+            snap.snapshot_id
+        ));
     } else {
         return Err(anyhow!(
             "Provide symbol_id, symbol_name, or file_path for impact_analyze"

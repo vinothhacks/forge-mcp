@@ -86,7 +86,10 @@ async fn bearer_auth_middleware(
         let header_token = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
+            .and_then(|s| {
+                s.strip_prefix("Bearer ")
+                    .or_else(|| s.strip_prefix("bearer "))
+            })
             .map(|s| s.trim());
 
         let query_token = query.get("token").map(|s| s.as_str());

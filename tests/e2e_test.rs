@@ -639,6 +639,235 @@ fn test_hybrid_search_symbol_intelligence_graph_impact_and_context_budget() {
     let _ = job_id;
 }
 
+/// job_cancel on a terminal job must keep its status and explain why via limitations;
+/// unknown job IDs must error without being recorded as cancelled.
+#[test]
+fn test_job_cancel_terminal_and_unknown_jobs() {
+    let ws_dir = create_multilang_workspace();
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let embedder = EmbeddingEngine::default();
+    let open_env = store
+        .open_workspace(
+            &WorkspaceOpenRequest {
+                path: ws_dir.path().to_string_lossy().into_owned(),
+                workspace_id: Some("ws-cancel-terminal".to_string()),
+                force_reindex: None,
+            },
+            &embedder,
+            &[],
+        )
+        .expect("open workspace");
+    let job_id = open_env.results[0].job_id.clone();
+
+    let env = store
+        .cancel_job(&JobCancelRequest {
+            job_id: job_id.clone(),
+        })
+        .expect("cancel completed job");
+    assert_eq!(env.results[0].status, JobStatusState::Completed);
+    assert!(
+        env.limitations
+            .iter()
+            .any(|l| l.contains("already completed") && l.contains("nothing to cancel")),
+        "expected limitation for completed job, got {:?}",
+        env.limitations
+    );
+    assert!(!store.is_job_cancelled(&job_id));
+
+    let err = store
+        .cancel_job(&JobCancelRequest {
+            job_id: "job-does-not-exist".to_string(),
+        })
+        .expect_err("unknown job must error");
+    assert!(err.to_string().contains("not found"), "got: {}", err);
+    assert!(!store.is_job_cancelled("job-does-not-exist"));
+
+    store
+        .insert_job(&JobRecord {
+            job_id: "job-running-limit".to_string(),
+            workspace_id: "ws-cancel-terminal".to_string(),
+            kind: "workspace_index".to_string(),
+            status: JobStatusState::Running,
+            progress_pct: 10,
+            processed_files: 1,
+            total_files: 10,
+            snapshot_id: None,
+            error: None,
+            created_at: "2026-10-26T00:00:00Z".to_string(),
+            updated_at: "2026-10-26T00:00:00Z".to_string(),
+        })
+        .expect("insert running job");
+    let env = store
+        .cancel_job(&JobCancelRequest {
+            job_id: "job-running-limit".to_string(),
+        })
+        .expect("cancel running job");
+    assert_eq!(env.results[0].status, JobStatusState::Cancelled);
+    assert!(env
+        .limitations
+        .iter()
+        .any(|l| l.contains("Cancellation requested")));
+    let env = store
+        .cancel_job(&JobCancelRequest {
+            job_id: "job-running-limit".to_string(),
+        })
+        .expect("cancel again");
+    assert_eq!(env.results[0].status, JobStatusState::Cancelled);
+    assert!(env
+        .limitations
+        .iter()
+        .any(|l| l.contains("already cancelled")));
+}
+
+/// Real mid-index cancellation: cancel a running workspace_open from another thread and
+/// verify the open fails, the job is recorded as cancelled, and no snapshot is activated.
+#[test]
+fn test_job_cancel_mid_index_aborts_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for i in 0..600 {
+        let mut src = String::from("import os\n\n");
+        for d in 0..12 {
+            src.push_str(&format!(
+                "def helper_{i}_{d}(a, b={d}):\n    x = a + b\n    if x > 10:\n        return helper_{i}_{n}(x, b)\n    return os.path.join(str(a), str(b))\n\n",
+                n = (d + 1) % 12
+            ));
+        }
+        fs::write(tmp.path().join(format!("mod{}.py", i)), src).expect("write fixture");
+    }
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let path = tmp.path().to_string_lossy().into_owned();
+    let worker_store = store.clone();
+    let worker = std::thread::spawn(move || {
+        worker_store.open_workspace(
+            &WorkspaceOpenRequest {
+                path,
+                workspace_id: Some("ws-cancel-mid".to_string()),
+                force_reindex: None,
+            },
+            &EmbeddingEngine::default(),
+            &[],
+        )
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let running_job = loop {
+        if let Ok(env) = store.job_status(&JobStatusRequest {
+            job_id: None,
+            workspace_id: Some("ws-cancel-mid".to_string()),
+        }) {
+            let job = env.results[0].clone();
+            assert_eq!(
+                job.status,
+                JobStatusState::Running,
+                "job finished before it could be cancelled"
+            );
+            break job;
+        }
+        assert!(std::time::Instant::now() < deadline, "job never started");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+
+    let cancel_env = store
+        .cancel_job(&JobCancelRequest {
+            job_id: running_job.job_id.clone(),
+        })
+        .expect("cancel running job");
+    assert_eq!(cancel_env.results[0].status, JobStatusState::Cancelled);
+
+    let open_result = worker.join().expect("worker thread");
+    let err = open_result.expect_err("cancelled open must fail");
+    assert!(err.to_string().contains("cancelled"), "got: {}", err);
+
+    let job = store.get_job(&running_job.job_id).expect("get job");
+    assert_eq!(job.status, JobStatusState::Cancelled);
+    assert!(job.snapshot_id.is_none());
+    assert!(store
+        .get_active_snapshot("ws-cancel-mid")
+        .expect("active snapshot query")
+        .is_none());
+}
+
+/// Cancellation that arrives after file parsing (during embedding) must still abort the
+/// open, roll back the snapshot, and leave the job cancelled (not overwritten as completed).
+#[test]
+fn test_job_cancel_after_parse_phase_rolls_back_snapshot() {
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    let ws_dir = create_multilang_workspace();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding stub");
+    let addr = listener.local_addr().expect("stub addr");
+    let (first_req_tx, first_req_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let mut first = true;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            if first {
+                first = false;
+                let _ = first_req_tx.send(());
+                let _ = release_rx.recv();
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let worker_store = store.clone();
+    let path = ws_dir.path().to_string_lossy().into_owned();
+    let endpoint = format!("http://{}", addr);
+    let worker = std::thread::spawn(move || {
+        let embedder = EmbeddingEngine::new(Some(endpoint), Some("stub-model".to_string()));
+        worker_store.open_workspace(
+            &WorkspaceOpenRequest {
+                path,
+                workspace_id: Some("ws-cancel-late".to_string()),
+                force_reindex: None,
+            },
+            &embedder,
+            &[],
+        )
+    });
+
+    // The first embedding request proves the indexer has finished the per-file parse loop.
+    first_req_rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("indexer reached embedding phase");
+    let job = store
+        .job_status(&JobStatusRequest {
+            job_id: None,
+            workspace_id: Some("ws-cancel-late".to_string()),
+        })
+        .expect("job_status")
+        .results[0]
+        .clone();
+    assert_eq!(job.status, JobStatusState::Running);
+    let cancel_env = store
+        .cancel_job(&JobCancelRequest {
+            job_id: job.job_id.clone(),
+        })
+        .expect("cancel running job");
+    assert_eq!(cancel_env.results[0].status, JobStatusState::Cancelled);
+    release_tx.send(()).expect("release stub");
+
+    let err = worker
+        .join()
+        .expect("worker thread")
+        .expect_err("open cancelled after parse phase must fail");
+    assert!(err.to_string().contains("cancelled"), "got: {}", err);
+    let job = store.get_job(&job.job_id).expect("get job");
+    assert_eq!(job.status, JobStatusState::Cancelled);
+    assert!(job.snapshot_id.is_none());
+    assert!(store
+        .get_active_snapshot("ws-cancel-late")
+        .expect("active snapshot query")
+        .is_none());
+}
+
 #[test]
 fn test_stdio_jsonrpc_e2e_subprocess() {
     let ws_dir = create_multilang_workspace();
@@ -679,7 +908,9 @@ fn test_stdio_jsonrpc_e2e_subprocess() {
     stdin.flush().expect("flush initialize");
 
     let mut line = String::new();
-    reader.read_line(&mut line).expect("read initialize response");
+    reader
+        .read_line(&mut line)
+        .expect("read initialize response");
     let init_resp: Value = serde_json::from_str(&line).expect("parse initialize JSON");
     assert_eq!(init_resp["id"], 1);
     assert_eq!(init_resp["result"]["serverInfo"]["name"], "forge-mcp");
@@ -718,7 +949,9 @@ fn test_stdio_jsonrpc_e2e_subprocess() {
         .expect("parse Content-Length value");
 
     let mut blank_line = String::new();
-    reader.read_line(&mut blank_line).expect("read CRLF separator");
+    reader
+        .read_line(&mut blank_line)
+        .expect("read CRLF separator");
 
     let mut body_buf = vec![0u8; content_len];
     reader
@@ -758,6 +991,119 @@ fn test_stdio_jsonrpc_e2e_subprocess() {
         open_resp["result"]["structuredContent"]["freshness"],
         "current"
     );
+
+    // 4. Batch [initialize, ping] -> array of 2; supported protocolVersion echoed + instructions
+    let batch_req = json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "rust-e2e", "version": "0.1.0" }
+            }
+        },
+        { "jsonrpc": "2.0", "id": 11, "method": "ping" }
+    ]);
+    writeln!(stdin, "{}", batch_req).expect("write batch");
+    stdin.flush().expect("flush batch");
+    line.clear();
+    reader.read_line(&mut line).expect("read batch response");
+    let batch_resp: Value = serde_json::from_str(&line).expect("parse batch JSON");
+    let batch_arr = batch_resp.as_array().expect("batch response is an array");
+    assert_eq!(batch_arr.len(), 2);
+    assert_eq!(batch_arr[0]["id"], 10);
+    assert_eq!(batch_arr[0]["result"]["protocolVersion"], "2025-06-18");
+    assert!(batch_arr[0]["result"]["instructions"].is_string());
+    assert_eq!(batch_arr[1]["id"], 11);
+    assert_eq!(batch_arr[1]["result"], json!({}));
+
+    // 5. Unsupported protocolVersion is negotiated down to the newest supported one
+    let old_init = json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "initialize",
+        "params": { "protocolVersion": "1999-01-01", "capabilities": {} }
+    });
+    writeln!(stdin, "{}", old_init).expect("write unsupported initialize");
+    stdin.flush().expect("flush unsupported initialize");
+    line.clear();
+    reader
+        .read_line(&mut line)
+        .expect("read unsupported initialize");
+    let old_resp: Value = serde_json::from_str(&line).expect("parse unsupported initialize");
+    assert_eq!(old_resp["id"], 12);
+    assert_eq!(old_resp["result"]["protocolVersion"], "2025-06-18");
+
+    // 6. Notifications (single and batched, incl. request-type methods) produce no output;
+    //    the next line must be the reply to the `id: 0` ping, echoed as 0.
+    writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "method": "ping" })).expect("write ping notif");
+    writeln!(
+        stdin,
+        "{}",
+        json!([
+            { "jsonrpc": "2.0", "method": "notifications/initialized" },
+            { "jsonrpc": "2.0", "method": "tools/list" }
+        ])
+    )
+    .expect("write notification batch");
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "jsonrpc": "2.0", "id": 0, "method": "ping" })
+    )
+    .expect("write id 0");
+    stdin.flush().expect("flush notifications");
+    line.clear();
+    reader.read_line(&mut line).expect("read id 0 response");
+    let zero_resp: Value = serde_json::from_str(&line).expect("parse id 0 JSON");
+    assert_eq!(
+        zero_resp["id"], 0,
+        "notifications must not be answered: {}",
+        line
+    );
+    assert_eq!(zero_resp["result"], json!({}));
+
+    // 7. Malformed JSON -> -32700 with id null, and the server keeps serving
+    writeln!(stdin, "{{\"jsonrpc\":").expect("write malformed JSON");
+    stdin.flush().expect("flush malformed JSON");
+    line.clear();
+    reader.read_line(&mut line).expect("read parse error");
+    let parse_err: Value = serde_json::from_str(&line).expect("parse -32700 JSON");
+    assert_eq!(parse_err["error"]["code"], -32700);
+    assert!(parse_err["id"].is_null());
+
+    // 8. Invalid UTF-8 line -> -32700 instead of terminating the process
+    stdin
+        .write_all(&[0xff, 0xfe, b'\n'])
+        .expect("write invalid UTF-8");
+    stdin.flush().expect("flush invalid UTF-8");
+    line.clear();
+    reader.read_line(&mut line).expect("read UTF-8 parse error");
+    let utf8_err: Value = serde_json::from_str(&line).expect("parse UTF-8 error JSON");
+    assert_eq!(utf8_err["error"]["code"], -32700);
+
+    // 9. Empty batch and request without method -> -32600 Invalid Request
+    writeln!(stdin, "[]").expect("write empty batch");
+    writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "id": 13 })).expect("write missing method");
+    stdin.flush().expect("flush invalid requests");
+    line.clear();
+    reader.read_line(&mut line).expect("read empty batch error");
+    let empty_err: Value = serde_json::from_str(&line).expect("parse empty batch error");
+    assert_eq!(empty_err["error"]["code"], -32600);
+    line.clear();
+    reader
+        .read_line(&mut line)
+        .expect("read missing method error");
+    let no_method: Value = serde_json::from_str(&line).expect("parse missing method error");
+    assert_eq!(no_method["id"], 13);
+    assert_eq!(no_method["error"]["code"], -32600);
+
+    // 10. A Content-Length frame cut off by EOF is treated as EOF (clean exit 0)
+    write!(stdin, "Content-Length: 100\r\n\r\n{{\"jsonrpc\":\"2.0\"")
+        .expect("write truncated frame");
+    stdin.flush().expect("flush truncated frame");
 
     drop(stdin);
     let status = child.wait().expect("wait for child exit");
@@ -950,4 +1296,880 @@ fn test_generate_persistent_verification_sqlite_db() {
         .expect("checkpoint WAL");
 
     assert!(Path::new(&db_path).exists());
+}
+
+/// Regression: `.gitignore` must be honored even when the workspace is NOT a git repository.
+/// `ignore::WalkBuilder` defaults to `require_git(true)`, which silently disabled gitignore
+/// handling for plain directories (no `.git/`), indexing files the user explicitly excluded.
+#[test]
+fn test_workspace_open_respects_gitignore_outside_git_repo() {
+    let ws_dir = create_multilang_workspace();
+    let root = ws_dir.path();
+    assert!(
+        !root.join(".git").exists(),
+        "fixture must not be a git repo"
+    );
+
+    fs::write(root.join(".gitignore"), "ignored/\n*.generated.ts\n").expect("write .gitignore");
+    fs::create_dir_all(root.join("ignored")).expect("create ignored dir");
+    fs::write(
+        root.join("ignored").join("skip.rs"),
+        "pub fn skipped_fn() -> u32 { 1 }\n",
+    )
+    .expect("write ignored/skip.rs");
+    fs::write(
+        root.join("src").join("x.generated.ts"),
+        "export function generatedFn(): number { return 1; }\n",
+    )
+    .expect("write src/x.generated.ts");
+
+    // Direct walker check: gitignored paths must not be discovered.
+    let discovered: Vec<String> = ForgeStore::collect_workspace_files(root)
+        .expect("collect files")
+        .into_iter()
+        .map(|(rel, _, _)| rel)
+        .collect();
+    assert!(
+        !discovered.iter().any(|p| p == "ignored/skip.rs"),
+        "ignored/skip.rs must be excluded by .gitignore, got {:?}",
+        discovered
+    );
+    assert!(
+        !discovered.iter().any(|p| p == "src/x.generated.ts"),
+        "src/x.generated.ts must be excluded by .gitignore, got {:?}",
+        discovered
+    );
+    assert!(discovered.iter().any(|p| p == "src/auth.rs"));
+
+    // End-to-end: workspace_open must index exactly the 5 fixture files.
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let embedder = EmbeddingEngine::default();
+    let open_env = store
+        .open_workspace(
+            &WorkspaceOpenRequest {
+                path: root.to_string_lossy().into_owned(),
+                workspace_id: Some("ws-gitignore".to_string()),
+                force_reindex: Some(false),
+            },
+            &embedder,
+            &[],
+        )
+        .expect("open_workspace should succeed");
+    assert_eq!(open_env.results.len(), 1);
+    assert_eq!(
+        open_env.results[0].file_count, 5,
+        "gitignored files must not be indexed outside a git repo"
+    );
+}
+
+#[test]
+fn test_symbol_find_rejects_or_aliases_unknown_kind() {
+    let ws_dir = create_multilang_workspace();
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let embedder = EmbeddingEngine::default();
+    store
+        .open_workspace(
+            &WorkspaceOpenRequest {
+                path: ws_dir.path().to_string_lossy().into_owned(),
+                workspace_id: Some("ws-kind".to_string()),
+                force_reindex: None,
+            },
+            &embedder,
+            &[],
+        )
+        .expect("open workspace");
+
+    let find = |kind: &str| {
+        store.find_symbols(&SymbolFindRequest {
+            workspace_id: "ws-kind".to_string(),
+            name: String::new(),
+            match_mode: Some(MatchMode::Substring),
+            kind: Some(kind.to_string()),
+            file_path: None,
+            language: None,
+            limit: Some(500),
+        })
+    };
+
+    // Unknown kinds must error, never silently fall back to functions.
+    for bad in ["bogus", "variable", "Enumeration"] {
+        let err = find(bad).expect_err("unknown kind must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown symbol kind"), "msg={msg}");
+        assert!(msg.contains(bad), "msg={msg}");
+    }
+
+    // Explicit empty kind behaves like no filter.
+    let all = find("  ").expect("empty kind is no filter");
+    assert_eq!(all.results.len(), 21, "fixture has 21 symbols");
+
+    // `enum` aliases to struct (parser indexes enum_item as Struct); case-insensitive.
+    let enums = find("ENUM").expect("enum alias");
+    let structs = find("struct").expect("struct kind");
+    assert_eq!(structs.results.len(), 2);
+    assert!(structs
+        .results
+        .iter()
+        .all(|h| h.symbol.kind == SymbolKind::Struct));
+    let names = |env: &ResponseEnvelope<SymbolFindHit>| {
+        env.results
+            .iter()
+            .map(|h| h.symbol.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&enums), names(&structs));
+
+    // Every canonical kind filters to exactly that kind, with fixture counts.
+    for (kind, want, count) in [
+        ("function", SymbolKind::Function, 6),
+        ("method", SymbolKind::Method, 6),
+        ("struct", SymbolKind::Struct, 2),
+        ("class", SymbolKind::Class, 3),
+        ("trait", SymbolKind::Trait, 1),
+        ("interface", SymbolKind::Interface, 2),
+        ("module", SymbolKind::Module, 1),
+    ] {
+        let env = find(kind).expect(kind);
+        assert_eq!(env.results.len(), count, "kind={kind}");
+        assert!(
+            env.results.iter().all(|h| h.symbol.kind == want),
+            "kind={kind}"
+        );
+    }
+}
+
+/// Regression (F6 symbol_read): an ambiguous `name` must prefer a definition
+/// over a one-line trait declaration, honor `file_path` disambiguation,
+/// surface the ambiguity in `limitations`, and give clear errors when the
+/// lookup key is missing or unknown.
+#[test]
+fn test_symbol_read_ambiguous_name_disambiguation_and_errors() {
+    let ws_dir = create_multilang_workspace();
+    // Make `verify` exist in Rust (trait decl + impl method) AND Python.
+    let py = ws_dir.path().join("src").join("pipeline.py");
+    let mut py_src = fs::read_to_string(&py).expect("read pipeline.py");
+    py_src.push_str("\ndef verify(token):\n    return True\n");
+    fs::write(&py, py_src).expect("append python verify");
+
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let embedder = EmbeddingEngine::default();
+    store
+        .open_workspace(
+            &WorkspaceOpenRequest {
+                path: ws_dir.path().to_string_lossy().into_owned(),
+                workspace_id: Some("ws-f6".to_string()),
+                force_reindex: None,
+            },
+            &embedder,
+            &[],
+        )
+        .expect("open workspace");
+
+    let read = |symbol_id: Option<&str>, name: Option<&str>, file_path: Option<&str>| {
+        store.read_symbol(&SymbolReadRequest {
+            workspace_id: "ws-f6".to_string(),
+            symbol_id: symbol_id.map(str::to_string),
+            name: name.map(str::to_string),
+            file_path: file_path.map(str::to_string),
+            context_lines: None,
+        })
+    };
+
+    // Rust file: impl method (definition, lines 13-15) wins over trait decl (line 3);
+    // parent is the impl target struct.
+    let rs = read(None, Some("verify"), Some("src/auth.rs")).expect("read rust verify");
+    let r = &rs.results[0];
+    assert_eq!(r.symbol.file_path, "src/auth.rs");
+    assert_eq!(r.symbol.qualified_name, "TokenValidator::verify");
+    assert_eq!(
+        r.parent_symbol.as_ref().map(|p| p.name.as_str()),
+        Some("TokenValidator")
+    );
+    assert!(r
+        .body
+        .contains("verify_hmac_token(token, &self.secret_salt)"));
+    // Still ambiguous inside the file (trait decl also matches) -> limitation present.
+    assert!(
+        rs.limitations
+            .iter()
+            .any(|l| l.contains("Ambiguous symbol name 'verify'")),
+        "limitations: {:?}",
+        rs.limitations
+    );
+
+    // Python file via file_path (backslash form must also work).
+    for fp in ["src/pipeline.py", r"src\pipeline.py"] {
+        let py = read(None, Some("verify"), Some(fp)).expect("read python verify");
+        assert_eq!(py.results[0].symbol.language, "python");
+        assert_eq!(py.results[0].symbol.file_path, "src/pipeline.py");
+        assert!(
+            py.limitations.is_empty(),
+            "unique in file: {:?}",
+            py.limitations
+        );
+    }
+
+    // No file_path: 3 candidates; limitation names them all.
+    let any = read(None, Some("verify"), None).expect("read ambiguous verify");
+    let amb = any
+        .limitations
+        .iter()
+        .find(|l| l.contains("Ambiguous symbol name 'verify'"))
+        .expect("ambiguity limitation");
+    assert!(amb.contains("3 candidates"), "{amb}");
+    assert!(amb.contains("Verifier::verify"), "{amb}");
+    assert!(amb.contains("src/pipeline.py"), "{amb}");
+    assert!(amb.contains("symbol_id"), "{amb}");
+    // Qualified name is an exact disambiguator.
+    let q = read(None, Some("TokenValidator::verify"), None).expect("qualified read");
+    assert_eq!(q.results[0].symbol.qualified_name, "TokenValidator::verify");
+    assert!(q.limitations.is_empty());
+
+    // Error paths.
+    let e = read(Some("sym-does-not-exist"), None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("not found"), "{e}");
+    assert!(e.contains("sym-does-not-exist"), "{e}");
+    let e = read(None, None, None).unwrap_err().to_string();
+    assert!(e.contains("requires 'symbol_id' or 'name'"), "{e}");
+    let e = read(None, Some("no_such_symbol_xyz"), None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("not found") && e.contains("no_such_symbol_xyz"),
+        "{e}"
+    );
+
+    // context_lines: 0 == body; huge value clamps to the file without error.
+    let c0 = read(None, Some("compute_hmac_digest"), None).expect("ctx default");
+    let sid = c0.results[0].symbol.symbol_id.clone();
+    let z = store
+        .read_symbol(&SymbolReadRequest {
+            workspace_id: "ws-f6".to_string(),
+            symbol_id: Some(sid.clone()),
+            name: None,
+            file_path: None,
+            context_lines: Some(0),
+        })
+        .expect("ctx 0");
+    assert_eq!(
+        z.results[0].enclosing_scope.as_deref(),
+        Some(z.results[0].body.as_str())
+    );
+    let big = store
+        .read_symbol(&SymbolReadRequest {
+            workspace_id: "ws-f6".to_string(),
+            symbol_id: Some(sid),
+            name: None,
+            file_path: None,
+            context_lines: Some(999),
+        })
+        .expect("ctx 999");
+    let whole = fs::read_to_string(ws_dir.path().join("src").join("auth.rs")).unwrap();
+    assert_eq!(
+        big.results[0].enclosing_scope.as_deref(),
+        Some(whole.lines().collect::<Vec<_>>().join("\n").as_str())
+    );
+}
+
+/// F7 regression: `include_declarations` must change the output (H3) and
+/// `file_path` must restrict hits to that file.
+#[test]
+fn test_symbol_references_include_declarations() {
+    let ws_dir = create_multilang_workspace();
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let embedder = EmbeddingEngine::default();
+    store
+        .open_workspace(
+            &WorkspaceOpenRequest {
+                path: ws_dir.path().to_string_lossy().into_owned(),
+                workspace_id: Some("ws-f7".to_string()),
+                force_reindex: None,
+            },
+            &embedder,
+            &[],
+        )
+        .expect("open workspace");
+
+    let req = |include: Option<bool>, file_path: Option<&str>| SymbolReferencesRequest {
+        workspace_id: "ws-f7".to_string(),
+        symbol_id: None,
+        symbol_name: Some("verify_hmac_token".to_string()),
+        name: None,
+        symbol: None,
+        file_path: file_path.map(|s| s.to_string()),
+        include_declarations: include,
+        limit: Some(20),
+    };
+
+    let without = store
+        .symbol_references(&req(Some(false), None))
+        .expect("refs false");
+    let with = store
+        .symbol_references(&req(Some(true), None))
+        .expect("refs true");
+    let default = store
+        .symbol_references(&req(None, None))
+        .expect("refs default");
+
+    assert_eq!(
+        without.results.len(),
+        default.results.len(),
+        "default == false"
+    );
+    assert!(
+        without
+            .results
+            .iter()
+            .all(|h| h.reference.reference_kind != "declaration"),
+        "include_declarations=false must not emit declaration hits"
+    );
+    assert_eq!(
+        with.results.len(),
+        without.results.len() + 1,
+        "include_declarations=true adds exactly one declaration hit"
+    );
+    let decl = &with.results[0].reference;
+    assert_eq!(decl.reference_kind, "declaration");
+    assert_eq!(decl.file_path, "src/auth.rs");
+    assert_eq!(decl.symbol_name, "verify_hmac_token");
+    assert!(decl.target_symbol_id.is_some());
+    assert!(with.results[0]
+        .surrounding_context
+        .contains("pub fn verify_hmac_token"));
+    assert_eq!(with.evidence.len(), with.results.len());
+    assert_eq!(with.evidence[0].producer, "forge-tree-sitter-symbol-reader");
+
+    // file_path restricts hits to that file.
+    let only_tests = store
+        .symbol_references(&req(Some(true), Some("tests/auth_test.rs")))
+        .expect("refs filtered");
+    assert!(!only_tests.results.is_empty());
+    assert!(only_tests
+        .results
+        .iter()
+        .all(|h| h.reference.file_path == "tests/auth_test.rs"));
+    assert!(
+        only_tests
+            .results
+            .iter()
+            .all(|h| h.reference.reference_kind != "declaration"),
+        "declaration lives in src/auth.rs so must be filtered out"
+    );
+}
+
+/// Regression (F8): graph_query must reject unknown query kinds, advertise every
+/// alias the request struct accepts, match importers by whole path segment, and
+/// flag hops whose target is outside the snapshot as unresolved.
+#[test]
+fn test_graph_query_strict_kind_aliases_and_importers() {
+    let ws_dir = create_multilang_workspace();
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let embedder = EmbeddingEngine::default();
+    store
+        .open_workspace(
+            &WorkspaceOpenRequest {
+                path: ws_dir.path().to_string_lossy().into_owned(),
+                workspace_id: Some("ws-f8".to_string()),
+                force_reindex: None,
+            },
+            &embedder,
+            &[],
+        )
+        .expect("open workspace");
+
+    let req = |v: Value| -> GraphQueryRequest {
+        let mut base = json!({ "workspace_id": "ws-f8" });
+        for (k, val) in v.as_object().unwrap() {
+            base[k] = val.clone();
+        }
+        serde_json::from_value(base).expect("deserialize GraphQueryRequest")
+    };
+
+    // Unknown query_kind is an error, not a silent `callers` fallback.
+    let err = graph_query(
+        &store,
+        &req(json!({ "query_kind": "foo", "symbol_name": "compute_hmac_digest" })),
+    )
+    .expect_err("unknown query_kind must fail");
+    assert!(err.to_string().contains("unknown query_kind"), "{err}");
+
+    // Every alias accepted by GraphQueryRequest yields the same callers result.
+    for args in [
+        json!({ "query_kind": "callers", "symbol_name": "compute_hmac_digest", "max_depth": 1 }),
+        json!({ "direction": "callers", "symbol_name": "compute_hmac_digest", "max_depth": 1 }),
+        json!({ "kind": "callers", "symbol_name": "compute_hmac_digest", "max_depth": 1 }),
+        json!({ "relation": "callers", "symbol_name": "compute_hmac_digest", "max_depth": 1 }),
+        json!({ "query_kind": "callers", "name": "compute_hmac_digest", "max_depth": 1 }),
+        json!({ "query_kind": "callers", "symbol": "compute_hmac_digest", "max_depth": 1 }),
+    ] {
+        let env = graph_query(&store, &req(args.clone())).expect("alias query");
+        let froms: Vec<&str> = env.results[0]
+            .hops
+            .iter()
+            .map(|h| h.relationship.from_name.as_str())
+            .collect();
+        assert_eq!(froms, vec!["verify_hmac_token"], "args={args}");
+    }
+
+    // The advertised schema lists every alias the struct accepts.
+    let defs = ForgeMcpServer::tool_definitions();
+    let gq = defs
+        .iter()
+        .find(|t| t["name"] == "graph_query")
+        .expect("graph_query tool");
+    let props = gq["inputSchema"]["properties"].as_object().unwrap();
+    for alias in [
+        "query_kind",
+        "direction",
+        "kind",
+        "relation",
+        "symbol_name",
+        "name",
+        "symbol",
+    ] {
+        assert!(props.contains_key(alias), "schema missing {alias}");
+    }
+
+    // Importers of src/auth.rs: tests/auth_test.rs (crate::auth::...) only, not ./auth_client.
+    let env = graph_query(
+        &store,
+        &req(json!({ "query_kind": "importers", "file_path": "src/auth.rs", "max_depth": 1 })),
+    )
+    .expect("importers");
+    let importers: Vec<&str> = env.results[0]
+        .hops
+        .iter()
+        .map(|h| h.relationship.from_file_path.as_str())
+        .collect();
+    assert_eq!(importers, vec!["tests/auth_test.rs"]);
+    assert!(
+        !importers.contains(&"src/gateway.ts"),
+        "\"./auth_client\" must not be treated as an import of src/auth.rs"
+    );
+
+    // Exact stem match still resolves relative specifiers: `./auth_client` -> auth_client.ts.
+    let env = graph_query(
+        &store,
+        &req(
+            json!({ "query_kind": "importers", "file_path": "src/auth_client.ts", "max_depth": 1 }),
+        ),
+    )
+    .expect("importers of auth_client");
+    let importers: Vec<&str> = env.results[0]
+        .hops
+        .iter()
+        .map(|h| h.relationship.from_file_path.as_str())
+        .collect();
+    assert_eq!(importers, vec!["src/gateway.ts"]);
+
+    // Imports of src/gateway.ts reach an external module -> limitation mentions unresolved.
+    let env = graph_query(
+        &store,
+        &req(json!({ "query_kind": "imports", "file_path": "src/gateway.ts", "max_depth": 1 })),
+    )
+    .expect("imports");
+    assert!(env.results[0]
+        .hops
+        .iter()
+        .any(|h| h.relationship.to_name == "./auth_client"));
+    assert!(
+        env.limitations.iter().any(|l| l.contains("unresolved")),
+        "{:?}",
+        env.limitations
+    );
+}
+
+#[test]
+fn test_context_build_snapshot_policy_values() {
+    let ws_dir = create_multilang_workspace();
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let embedder = EmbeddingEngine::default();
+
+    store
+        .open_workspace(
+            &WorkspaceOpenRequest {
+                path: ws_dir.path().to_string_lossy().into_owned(),
+                workspace_id: Some("ws-policy".to_string()),
+                force_reindex: Some(false),
+            },
+            &embedder,
+            &[],
+        )
+        .expect("open_workspace should succeed");
+
+    let req = |policy: Option<&str>| ContextBuildRequest {
+        workspace_id: "ws-policy".to_string(),
+        query: "how are bearer tokens sanitized and HMAC digests verified?".to_string(),
+        token_budget: Some(4000),
+        include_tests: Some(true),
+        snapshot_policy: policy.map(|p| p.to_string()),
+        language: None,
+        path_prefix: None,
+    };
+
+    // Fresh snapshot: every valid policy succeeds; an unknown value is rejected even when fresh.
+    for policy in [
+        None,
+        Some("require_current"),
+        Some("require_current_strict"),
+        Some("allow_stale"),
+    ] {
+        let env = context_build(&store, &embedder, &req(policy)).unwrap_or_else(|e| {
+            panic!("fresh snapshot, policy {:?} should succeed: {}", policy, e)
+        });
+        assert_eq!(env.freshness, Freshness::Current);
+        assert!(!env.limitations.iter().any(|l| l.contains("stale")));
+    }
+    let bogus_fresh = context_build(&store, &embedder, &req(Some("bogus_policy")))
+        .expect_err("unknown snapshot_policy must be rejected");
+    assert!(bogus_fresh.to_string().contains("unknown snapshot_policy"));
+
+    // Make the snapshot stale by editing an indexed file on disk.
+    let auth_path = ws_dir.path().join("src").join("auth.rs");
+    let mut auth_src = fs::read_to_string(&auth_path).expect("read auth.rs");
+    auth_src.push_str("\n/// Added after indexing to make the snapshot stale.\npub fn stale_marker() -> u8 { 1 }\n");
+    fs::write(&auth_path, auth_src).expect("rewrite auth.rs");
+
+    // require_current (and its strict alias) must fail on a stale snapshot.
+    for policy in ["require_current", "require_current_strict"] {
+        let err = context_build(&store, &embedder, &req(Some(policy)))
+            .expect_err("stale snapshot with require_current must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stale"),
+            "error should mention staleness: {}",
+            msg
+        );
+        assert!(
+            msg.contains(policy),
+            "error should name the policy: {}",
+            msg
+        );
+    }
+
+    // allow_stale and omitted policy proceed and surface a staleness limitation.
+    for policy in [Some("allow_stale"), None] {
+        let env = context_build(&store, &embedder, &req(policy)).unwrap_or_else(|e| {
+            panic!("stale snapshot, policy {:?} should succeed: {}", policy, e)
+        });
+        assert_eq!(env.freshness, Freshness::Stale);
+        assert!(!env.results[0].snippets.is_empty());
+        assert!(
+            env.limitations
+                .iter()
+                .any(|l| l.contains("stale") && l.contains("src/auth.rs")),
+            "limitations should report staleness: {:?}",
+            env.limitations
+        );
+    }
+
+    // Unknown values are still rejected when stale, before any retrieval happens.
+    let bogus_stale = context_build(&store, &embedder, &req(Some("bogus_policy")))
+        .expect_err("unknown snapshot_policy must be rejected");
+    assert!(bogus_stale.to_string().contains("unknown snapshot_policy"));
+}
+
+#[test]
+fn test_context_build_graph_expansion_respects_filters() {
+    let ws_dir = create_multilang_workspace();
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let embedder = EmbeddingEngine::default();
+
+    store
+        .open_workspace(
+            &WorkspaceOpenRequest {
+                path: ws_dir.path().to_string_lossy().into_owned(),
+                workspace_id: Some("ws-filters".to_string()),
+                force_reindex: Some(false),
+            },
+            &embedder,
+            &[],
+        )
+        .expect("open_workspace should succeed");
+
+    let req = |language: Option<&str>, path_prefix: Option<&str>| ContextBuildRequest {
+        workspace_id: "ws-filters".to_string(),
+        query: "verify_hmac_token".to_string(),
+        token_budget: Some(8000),
+        include_tests: Some(true),
+        snapshot_policy: None,
+        language: language.map(|l| l.to_string()),
+        path_prefix: path_prefix.map(|p| p.to_string()),
+    };
+
+    // path_prefix must also constrain graph-expanded neighbors, not only primary hits.
+    // With path_prefix=src/, the tests/ caller of verify_hmac_token is not a primary hit, so before
+    // the fix 1-hop expansion re-introduced it. Expansion must still run (src/ neighbors exist).
+    let by_prefix =
+        context_build(&store, &embedder, &req(None, Some("src/"))).expect("path_prefix");
+    assert!(!by_prefix.results[0].snippets.is_empty());
+    assert!(
+        by_prefix.results[0].graph_expanded_items >= 1,
+        "graph expansion should still add src/ neighbors"
+    );
+    for s in &by_prefix.results[0].snippets {
+        assert!(
+            s.file_path.starts_with("src/"),
+            "path_prefix=src/ leaked {} ({})",
+            s.file_path,
+            s.inclusion_reason
+        );
+    }
+    assert_eq!(
+        by_prefix.evidence.len(),
+        by_prefix.results[0].snippets.len()
+    );
+
+    // language must also constrain graph-expanded neighbors.
+    let by_lang = context_build(&store, &embedder, &req(Some("rust"), None)).expect("language");
+    assert!(!by_lang.results[0].snippets.is_empty());
+    for s in &by_lang.results[0].snippets {
+        assert_eq!(
+            s.language, "rust",
+            "language=rust leaked {} ({})",
+            s.file_path, s.inclusion_reason
+        );
+    }
+}
+
+/// F15 regression: Tree-sitter coverage for every supported extension, TSX/JSX
+/// reported under their family language filters, and Go receiver parents.
+#[test]
+fn test_language_coverage_matrix() {
+    use std::collections::BTreeSet;
+
+    let tmp = tempfile::tempdir().expect("create temp workspace");
+    let root = tmp.path();
+    let files: &[(&str, &str)] = &[
+        (
+            "rust.rs",
+            "use std::collections::HashMap;\n\nfn private_fn() {}\n\n/// doc\npub fn public_fn() {}\n\npub struct S;\n\npub enum Color { Red }\n\npub trait T { fn t(&self); }\n\nmod inner { pub fn nested() {} }\n\nimpl T for S { fn t(&self) { public_fn(); } }\n\nimpl S { pub fn assoc() {} }\n",
+        ),
+        (
+            "ts.ts",
+            "import { x } from \"./x\";\n\n/** doc */\nexport function f() {}\n\nconst g = () => {};\n\nexport const h = async () => {};\n\ninterface J {}\n\ninterface I extends J {}\n\nclass B {}\n\nexport class C extends B implements I { m() { f(); } }\n\nnamespace N { export function n() {} }\n\nnew C();\n",
+        ),
+        (
+            "tsx.tsx",
+            "function f() {}\n\nexport function App() { return <div onClick={() => f()} />; }\n",
+        ),
+        ("js.js", "function a() {}\nclass K { m() {} }\nconst arr = () => {};\n"),
+        (
+            "js.mjs",
+            "import fs from \"fs\";\nexport function ma() {}\nclass MK { mm() {} }\nconst marr = () => {};\n",
+        ),
+        (
+            "js.cjs",
+            "const r = require(\"fs\");\nfunction ca() {}\nclass CK { cm() {} }\nconst carr = () => {};\nmodule.exports = { ca };\n",
+        ),
+        (
+            "jsx.jsx",
+            "function Comp() { return <div className=\"x\" />; }\nclass JK { render() { return <span />; } }\nconst jarr = () => <p />;\n",
+        ),
+        (
+            "py.py",
+            "import os\nfrom a import b\n\ndef top():\n    pass\n\ndef _private():\n    pass\n\nclass Base:\n    pass\n\nclass Child(Base):\n    \"\"\"Child doc.\"\"\"\n    def method(self):\n        \"\"\"method doc\"\"\"\n        top()\n",
+        ),
+        ("pyi.pyi", "def stub(x: int) -> int: ...\nclass StubClass: ...\n"),
+        (
+            "go.go",
+            "package pkg\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\ntype Iface interface {\n\tM()\n}\n\ntype St struct{}\n\n// F does X\nfunc F() {}\n\nfunc (s *St) M() { F() }\n\ntype Box[T any] struct{ v T }\n\nfunc (b *Box[T]) Get() T { return b.v }\n",
+        ),
+        ("broken.rs", "fn ok() {}  fn broken( {\n"),
+        ("notes.txt", "plain text, not code\n"),
+    ];
+    for (name, body) in files {
+        fs::write(root.join(name), body).expect("write fixture file");
+    }
+
+    let store = ForgeStore::open_in_memory().expect("open in-memory store");
+    let embedder = EmbeddingEngine::default();
+    let open_env = store
+        .open_workspace(
+            &WorkspaceOpenRequest {
+                path: root.to_string_lossy().into_owned(),
+                workspace_id: Some("ws-lang-matrix".to_string()),
+                force_reindex: Some(true),
+            },
+            &embedder,
+            &[],
+        )
+        .expect("open_workspace should index every grammar, including broken.rs");
+    // 11 source files; notes.txt is skipped (unknown extension).
+    assert_eq!(open_env.results[0].file_count, 11);
+
+    let find = |lang: &str| -> Vec<Symbol> {
+        store
+            .find_symbols(&SymbolFindRequest {
+                workspace_id: "ws-lang-matrix".to_string(),
+                name: String::new(),
+                match_mode: Some(MatchMode::Substring),
+                kind: None,
+                file_path: None,
+                language: Some(lang.to_string()),
+                limit: Some(500),
+            })
+            .expect("find_symbols by language")
+            .results
+            .into_iter()
+            .map(|h| h.symbol)
+            .collect()
+    };
+    let by_file = |syms: &[Symbol], file: &str| -> BTreeSet<(String, String)> {
+        syms.iter()
+            .filter(|s| s.file_path == file)
+            .map(|s| (s.name.clone(), s.kind.as_str().to_string()))
+            .collect()
+    };
+    let set = |pairs: &[(&str, &str)]| -> BTreeSet<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, k)| (n.to_string(), k.to_string()))
+            .collect()
+    };
+
+    let rust = find("rust");
+    assert_eq!(
+        by_file(&rust, "rust.rs"),
+        set(&[
+            ("private_fn", "function"),
+            ("public_fn", "function"),
+            ("S", "struct"),
+            ("Color", "struct"),
+            ("T", "trait"),
+            ("t", "method"),
+            ("inner", "module"),
+            ("nested", "method"),
+            ("assoc", "method"),
+        ])
+    );
+    assert!(by_file(&rust, "broken.rs").contains(&("ok".to_string(), "function".to_string())));
+    let public_fn = rust
+        .iter()
+        .find(|s| s.name == "public_fn")
+        .expect("public_fn");
+    assert_eq!(public_fn.doc_comment.as_deref(), Some("doc"));
+    assert_eq!(public_fn.visibility.as_deref(), Some("pub"));
+
+    // H6: the "typescript" filter must include .tsx symbols (TSX grammar still used).
+    let ts = find("typescript");
+    assert_eq!(
+        by_file(&ts, "ts.ts"),
+        set(&[
+            ("f", "function"),
+            ("g", "function"),
+            ("h", "function"),
+            ("J", "interface"),
+            ("I", "interface"),
+            ("B", "class"),
+            ("C", "class"),
+            ("m", "method"),
+            ("N", "module"),
+            ("n", "function"),
+        ])
+    );
+    assert_eq!(
+        by_file(&ts, "tsx.tsx"),
+        set(&[("f", "function"), ("App", "function")])
+    );
+    assert!(ts.iter().all(|s| s.language == "typescript"));
+    assert!(
+        find("tsx").is_empty(),
+        "tsx is no longer a separate language value"
+    );
+
+    // H6: the "javascript" filter must include .js/.mjs/.cjs/.jsx symbols.
+    let js = find("javascript");
+    assert_eq!(
+        by_file(&js, "js.js"),
+        set(&[
+            ("a", "function"),
+            ("K", "class"),
+            ("m", "method"),
+            ("arr", "function")
+        ])
+    );
+    assert_eq!(
+        by_file(&js, "js.mjs"),
+        set(&[
+            ("ma", "function"),
+            ("MK", "class"),
+            ("mm", "method"),
+            ("marr", "function")
+        ])
+    );
+    assert_eq!(
+        by_file(&js, "js.cjs"),
+        set(&[
+            ("ca", "function"),
+            ("CK", "class"),
+            ("cm", "method"),
+            ("carr", "function")
+        ])
+    );
+    assert_eq!(
+        by_file(&js, "jsx.jsx"),
+        set(&[
+            ("Comp", "function"),
+            ("JK", "class"),
+            ("render", "method"),
+            ("jarr", "function")
+        ])
+    );
+    assert!(
+        find("jsx").is_empty(),
+        "jsx is no longer a separate language value"
+    );
+
+    let py = find("python");
+    assert_eq!(
+        by_file(&py, "py.py"),
+        set(&[
+            ("top", "function"),
+            ("_private", "function"),
+            ("Base", "class"),
+            ("Child", "class"),
+            ("method", "method"),
+        ])
+    );
+    assert_eq!(
+        by_file(&py, "pyi.pyi"),
+        set(&[("stub", "function"), ("StubClass", "class")])
+    );
+    let private = py.iter().find(|s| s.name == "_private").expect("_private");
+    assert_eq!(private.visibility.as_deref(), Some("private"));
+    let child = py.iter().find(|s| s.name == "Child").expect("Child");
+    assert_eq!(child.doc_comment.as_deref(), Some("Child doc."));
+
+    // Go: method receiver `(s *St)` resolves to parent St, not the parameter name `s`.
+    let go = find("go");
+    assert_eq!(
+        by_file(&go, "go.go"),
+        set(&[
+            ("pkg", "module"),
+            ("Iface", "interface"),
+            ("St", "struct"),
+            ("F", "function"),
+            ("M", "method"),
+            ("Box", "struct"),
+            ("Get", "method"),
+        ])
+    );
+    let st = go.iter().find(|s| s.name == "St").expect("St");
+    let m = go.iter().find(|s| s.name == "M").expect("M");
+    assert_eq!(m.qualified_name, "St.M");
+    assert_eq!(m.parent_symbol_id.as_deref(), Some(st.symbol_id.as_str()));
+    // Generic pointer receiver `(b *Box[T])` resolves to Box (same bug class as
+    // `(r *HttpRouter)` being indexed as `r.Dispatch`).
+    let boxed = go.iter().find(|s| s.name == "Box").expect("Box");
+    let get = go.iter().find(|s| s.name == "Get").expect("Get");
+    assert_eq!(get.qualified_name, "Box.Get");
+    assert_eq!(
+        get.parent_symbol_id.as_deref(),
+        Some(boxed.symbol_id.as_str())
+    );
+    let f = go.iter().find(|s| s.name == "F").expect("F");
+    assert_eq!(f.doc_comment.as_deref(), Some("F does X"));
 }

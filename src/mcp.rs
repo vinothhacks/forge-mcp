@@ -8,6 +8,32 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
+/// MCP protocol revisions this server implements, newest first. `initialize`
+/// echoes the client's requested revision when it is listed here and otherwise
+/// answers with the newest one, per the MCP version-negotiation rules.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Usage hint returned in the `initialize` result (`instructions`).
+pub const SERVER_INSTRUCTIONS: &str = "Forge indexes local codebases for search and code intelligence. \
+Call workspace_open with a directory path first; it returns a workspace_id. Pass that workspace_id to \
+code_search, symbol_find, symbol_read, symbol_references, graph_query, impact_analyze and context_build. \
+Use workspace_status to check index freshness and job_status/job_cancel for indexing jobs.";
+
+/// Largest Content-Length frame body accepted on stdio; larger frames are drained and rejected.
+pub const MAX_STDIO_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// Pick the protocol revision to answer `initialize` with.
+pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|v| {
+            SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .copied()
+                .find(|s| *s == v)
+        })
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
+}
+
 #[derive(Clone)]
 pub struct ForgeMcpServer {
     pub store: ForgeStore,
@@ -16,11 +42,7 @@ pub struct ForgeMcpServer {
 }
 
 impl ForgeMcpServer {
-    pub fn new(
-        store: ForgeStore,
-        embedder: EmbeddingEngine,
-        allowed_roots: Vec<PathBuf>,
-    ) -> Self {
+    pub fn new(store: ForgeStore, embedder: EmbeddingEngine, allowed_roots: Vec<PathBuf>) -> Self {
         Self {
             store,
             embedder,
@@ -53,6 +75,14 @@ impl ForgeMcpServer {
 
     pub fn handle_jsonrpc_value(&self, req: Value) -> Option<Value> {
         if let Some(arr) = req.as_array() {
+            // JSON-RPC 2.0 section6: an empty batch is answered with a single Invalid Request error
+            if arr.is_empty() {
+                return Some(Self::err_response(
+                    None,
+                    -32600,
+                    "Invalid Request: empty batch",
+                ));
+            }
             let mut responses = Vec::new();
             for item in arr {
                 if let Some(r) = self.handle_single_request(item.clone()) {
@@ -70,34 +100,38 @@ impl ForgeMcpServer {
     }
 
     fn handle_single_request(&self, req: Value) -> Option<Value> {
+        if !req.is_object() {
+            return Some(Self::err_response(
+                None,
+                -32600,
+                "Invalid Request: expected a JSON-RPC request object",
+            ));
+        }
         let id = req.get("id").cloned();
-        let method = req
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("")
-            .to_string();
-        let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-
-        // JSON-RPC notifications have no `id` field (or null in some clients)
+        // JSON-RPC notifications have no `id` member; `"id": null` is answered like a request
         let is_notification = id.is_none();
 
-        match method.as_str() {
+        let method = match req.get("method").and_then(|m| m.as_str()) {
+            Some(m) => m.to_string(),
+            None => {
+                return Some(Self::err_response(
+                    id,
+                    -32600,
+                    "Invalid Request: missing or non-string 'method'",
+                ));
+            }
+        };
+        let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+
+        let response = match method.as_str() {
             "notifications/initialized" | "initialized" | "notifications/cancelled" => {
-                if is_notification {
-                    return None;
-                }
-                return Some(Self::ok_response(id, json!({})));
+                Some(Self::ok_response(id, json!({})))
             }
-            "ping" => {
-                return Some(Self::ok_response(id, json!({})));
-            }
+            "ping" => Some(Self::ok_response(id, json!({}))),
             "initialize" => {
-                let client_proto = params
-                    .get("protocolVersion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("2024-11-05");
+                let requested = params.get("protocolVersion").and_then(|v| v.as_str());
                 let res = json!({
-                    "protocolVersion": client_proto,
+                    "protocolVersion": negotiate_protocol_version(requested),
                     "capabilities": {
                         "tools": {
                             "listChanged": false
@@ -106,21 +140,19 @@ impl ForgeMcpServer {
                     "serverInfo": {
                         "name": "forge-mcp",
                         "version": env!("CARGO_PKG_VERSION")
-                    }
+                    },
+                    "instructions": SERVER_INSTRUCTIONS
                 });
-                return Some(Self::ok_response(id, res));
+                Some(Self::ok_response(id, res))
             }
             "tools/list" => {
                 let res = json!({
                     "tools": Self::tool_definitions()
                 });
-                return Some(Self::ok_response(id, res));
+                Some(Self::ok_response(id, res))
             }
             "tools/call" => {
-                let tool_name = params
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("");
+                let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let args = params
                     .get("arguments")
                     .cloned()
@@ -128,8 +160,8 @@ impl ForgeMcpServer {
 
                 match self.dispatch_tool(tool_name, args) {
                     Ok(envelope_val) => {
-                        let serialized =
-                            serde_json::to_string(&envelope_val).unwrap_or_else(|_| "{}".to_string());
+                        let serialized = serde_json::to_string(&envelope_val)
+                            .unwrap_or_else(|_| "{}".to_string());
                         let res = json!({
                             "content": [
                                 {
@@ -149,17 +181,18 @@ impl ForgeMcpServer {
                     )),
                 }
             }
-            _ => {
-                if is_notification {
-                    None
-                } else {
-                    Some(Self::err_response(
-                        id,
-                        -32601,
-                        &format!("Method not found: {}", method),
-                    ))
-                }
-            }
+            _ => Some(Self::err_response(
+                id,
+                -32601,
+                &format!("Method not found: {}", method),
+            )),
+        };
+
+        // JSON-RPC 2.0 section4.1: the server MUST NOT reply to a notification
+        if is_notification {
+            None
+        } else {
+            response
         }
     }
 
@@ -281,7 +314,7 @@ impl ForgeMcpServer {
                         "query": { "type": "string", "description": "Search query (identifiers, keywords, or natural language)" },
                         "language": { "type": "string", "description": "Optional language filter (rust, typescript, javascript, python, go)" },
                         "path_prefix": { "type": "string", "description": "Optional relative file path prefix filter" },
-                        "limit": { "type": "integer", "description": "Maximum number of results to return (default 15)" },
+                        "limit": { "type": "integer", "description": "Maximum number of results to return (default 15, clamped to 1..100)" },
                         "include_tests": { "type": "boolean", "description": "Whether to include test files (default true)" }
                     },
                     "required": ["workspace_id", "query"]
@@ -299,14 +332,14 @@ impl ForgeMcpServer {
                         "kind": { "type": "string", "description": "Optional symbol kind filter (function, struct, class, interface, method, trait, module)" },
                         "file_path": { "type": "string", "description": "Optional file path filter" },
                         "language": { "type": "string", "description": "Optional language filter" },
-                        "limit": { "type": "integer", "description": "Maximum results (default 50)" }
+                        "limit": { "type": "integer", "description": "Maximum results (default 50, clamped to 1..500)" }
                     },
                     "required": ["workspace_id", "name"]
                 }
             }),
             json!({
                 "name": "symbol_read",
-                "description": "Read complete symbol source body, signature, doc comments, and enclosing scope with exact line ranges and content hash.",
+                "description": "Read complete symbol source body, signature, doc comments, and surrounding lines with exact line ranges and content hash. Provide symbol_id, or name (optionally with file_path to disambiguate).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -329,9 +362,10 @@ impl ForgeMcpServer {
                         "symbol_id": { "type": "string", "description": "Target symbol ID" },
                         "symbol_name": { "type": "string", "description": "Target symbol name" },
                         "name": { "type": "string", "description": "Alias for symbol_name" },
-                        "file_path": { "type": "string", "description": "Optional file path disambiguator" },
-                        "include_declarations": { "type": "boolean", "description": "Include declaration site" },
-                        "limit": { "type": "integer", "description": "Maximum references to return (default 100)" }
+                        "symbol": { "type": "string", "description": "Alias for symbol_name" },
+                        "file_path": { "type": "string", "description": "Optional file path: restricts hits to this file and disambiguates the target symbol" },
+                        "include_declarations": { "type": "boolean", "description": "Prepend the symbol's declaration site as a hit with reference_kind \"declaration\" (default false)" },
+                        "limit": { "type": "integer", "description": "Maximum references to return (default 100, clamped to 1..500)" }
                     },
                     "required": ["workspace_id"]
                 }
@@ -346,14 +380,16 @@ impl ForgeMcpServer {
                         "query_kind": { "type": "string", "enum": ["callers", "callees", "imports", "importers", "children", "implements", "path"], "description": "Relationship query kind" },
                         "direction": { "type": "string", "enum": ["callers", "callees", "imports", "importers", "children", "implements", "path"], "description": "Alias for query_kind" },
                         "kind": { "type": "string", "enum": ["callers", "callees", "imports", "importers", "children", "implements", "path"], "description": "Alias for query_kind" },
+                        "relation": { "type": "string", "enum": ["callers", "callees", "imports", "importers", "children", "implements", "path"], "description": "Alias for query_kind" },
                         "symbol_id": { "type": "string", "description": "Starting symbol ID" },
                         "symbol_name": { "type": "string", "description": "Starting symbol name" },
                         "name": { "type": "string", "description": "Alias for symbol_name" },
+                        "symbol": { "type": "string", "description": "Alias for symbol_name" },
                         "file_path": { "type": "string", "description": "Optional file path for file-level import queries" },
                         "target_symbol_id": { "type": "string", "description": "Target symbol ID when query_kind is 'path'" },
                         "target_symbol_name": { "type": "string", "description": "Target symbol name when query_kind is 'path'" },
-                        "max_depth": { "type": "integer", "description": "Maximum traversal depth (default 2, max 8)" },
-                        "limit": { "type": "integer", "description": "Maximum edges to return (default 100)" }
+                        "max_depth": { "type": "integer", "description": "Maximum traversal depth (default 2, clamped to 1..8)" },
+                        "limit": { "type": "integer", "description": "Maximum edges to return (default 100, clamped to 1..500)" }
                     },
                     "required": ["workspace_id"]
                 }
@@ -368,8 +404,9 @@ impl ForgeMcpServer {
                         "symbol_id": { "type": "string", "description": "Symbol ID being modified" },
                         "symbol_name": { "type": "string", "description": "Symbol name being modified" },
                         "name": { "type": "string", "description": "Alias for symbol_name" },
+                        "symbol": { "type": "string", "description": "Alias for symbol_name" },
                         "file_path": { "type": "string", "description": "File path being modified" },
-                        "max_depth": { "type": "integer", "description": "Maximum transitive depth (default 3)" }
+                        "max_depth": { "type": "integer", "description": "Maximum transitive depth (default 3, clamped to 1..8)" }
                     },
                     "required": ["workspace_id"]
                 }
@@ -382,9 +419,13 @@ impl ForgeMcpServer {
                     "properties": {
                         "workspace_id": { "type": "string", "description": "Workspace identifier" },
                         "query": { "type": "string", "description": "Natural-language or code task query" },
-                        "token_budget": { "type": "integer", "description": "Maximum token budget (default 4000)" },
+                        "token_budget": { "type": "integer", "description": "Maximum token budget (default 4000; clamped to 64..=128000)" },
                         "include_tests": { "type": "boolean", "description": "Whether to include test files (default true)" },
-                        "snapshot_policy": { "type": "string", "description": "Snapshot freshness policy (require_current, allow_stale)" },
+                        "snapshot_policy": {
+                            "type": "string",
+                            "enum": ["require_current", "allow_stale", "require_current_strict"],
+                            "description": "Snapshot freshness policy. require_current: fail if the active snapshot is stale (require_current_strict is an alias). allow_stale (default): proceed and report staleness in limitations. Any other value is rejected."
+                        },
                         "language": { "type": "string", "description": "Optional language filter" },
                         "path_prefix": { "type": "string", "description": "Optional path prefix filter" }
                     },
@@ -393,7 +434,7 @@ impl ForgeMcpServer {
             }),
             json!({
                 "name": "job_status",
-                "description": "Inspect background or completed indexing job status.",
+                "description": "Inspect background or completed indexing job status. Provide job_id, or workspace_id to get that workspace's latest job.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -425,11 +466,23 @@ impl ForgeMcpServer {
         let mut writer = stdout.lock();
 
         loop {
-            let mut line = String::new();
-            let n = reader.read_line(&mut line)?;
+            let mut raw_line = Vec::new();
+            let n = reader.read_until(b'\n', &mut raw_line)?;
             if n == 0 {
                 break; // EOF
             }
+
+            // Invalid UTF-8 must not stop the server: answer with a parse error and keep serving
+            let line = match String::from_utf8(raw_line) {
+                Ok(s) => s,
+                Err(_) => {
+                    let err =
+                        Self::err_response(None, -32700, "Parse error: message is not valid UTF-8");
+                    writeln!(writer, "{}", serde_json::to_string(&err)?)?;
+                    writer.flush()?;
+                    continue;
+                }
+            };
 
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -440,20 +493,56 @@ impl ForgeMcpServer {
                 let len_str = trimmed["content-length:".len()..].trim();
                 let content_len: usize = match len_str.parse() {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(_) => {
+                        tracing::warn!("ignoring invalid Content-Length header: {:?}", len_str);
+                        continue;
+                    }
                 };
 
                 // Consume remaining HTTP-style headers until empty line
                 loop {
-                    let mut hdr = String::new();
-                    let hn = reader.read_line(&mut hdr)?;
-                    if hn == 0 || hdr.trim().is_empty() {
+                    let mut hdr = Vec::new();
+                    let hn = reader.read_until(b'\n', &mut hdr)?;
+                    if hn == 0 || hdr.iter().all(|b| b.is_ascii_whitespace()) {
                         break;
                     }
                 }
 
+                if content_len > MAX_STDIO_FRAME_BYTES {
+                    // Drain the oversized body without buffering it, then reject the frame
+                    let drained = std::io::copy(
+                        &mut Read::take(&mut reader, content_len as u64),
+                        &mut std::io::sink(),
+                    )?;
+                    let err = serde_json::to_string(&Self::err_response(
+                        None,
+                        -32600,
+                        &format!(
+                            "Invalid Request: Content-Length {} exceeds limit of {} bytes",
+                            content_len, MAX_STDIO_FRAME_BYTES
+                        ),
+                    ))?;
+                    write!(writer, "Content-Length: {}\r\n\r\n{}", err.len(), err)?;
+                    writer.flush()?;
+                    if (drained as usize) < content_len {
+                        break; // EOF inside the oversized body
+                    }
+                    continue;
+                }
+
                 let mut body_buf = vec![0u8; content_len];
-                reader.read_exact(&mut body_buf)?;
+                match reader.read_exact(&mut body_buf) {
+                    Ok(()) => {}
+                    // Client closed stdin mid-frame: treat as EOF, not as a server failure
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        tracing::warn!(
+                            "stdin closed inside a {}-byte Content-Length frame",
+                            content_len
+                        );
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
                 let body_str = String::from_utf8_lossy(&body_buf);
 
                 if let Some(resp_json) = self.handle_jsonrpc_str(&body_str)? {

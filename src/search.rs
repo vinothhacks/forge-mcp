@@ -7,29 +7,58 @@ use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 
 pub fn is_test_path_or_symbol(file_path: &str, symbol_name: Option<&str>) -> bool {
-    let fp = file_path.to_ascii_lowercase();
-    if fp.contains("/test/")
-        || fp.contains("/tests/")
-        || fp.starts_with("tests/")
-        || fp.starts_with("test/")
-        || fp.ends_with("_test.rs")
-        || fp.ends_with("_test.go")
-        || fp.ends_with("_test.py")
-        || fp.ends_with(".test.ts")
-        || fp.ends_with(".test.js")
-        || fp.ends_with(".spec.ts")
-        || fp.ends_with(".spec.js")
-        || fp.contains("test_")
-    {
+    let fp = file_path.replace('\\', "/").to_ascii_lowercase();
+    let mut segments = fp.split('/').filter(|s| !s.is_empty()).peekable();
+    let mut file_name = "";
+    while let Some(seg) = segments.next() {
+        if segments.peek().is_none() {
+            file_name = seg;
+            break;
+        }
+        // Directory segment: match whole test directories only, never substrings.
+        if matches!(seg, "tests" | "test" | "__tests__" | "spec") {
+            return true;
+        }
+    }
+    if is_test_file_name(file_name) {
         return true;
     }
     if let Some(sn) = symbol_name {
-        let sn_l = sn.to_ascii_lowercase();
-        if sn_l.starts_with("test_") || sn_l.contains("::test_") {
+        let short = sn.rsplit([':', '.']).next().unwrap_or(sn);
+        if short.to_ascii_lowercase().starts_with("test_") {
+            return true;
+        }
+        // Go convention: `TestXxx` functions are tests.
+        if short.starts_with("Test")
+            && short
+                .chars()
+                .nth(4)
+                .map(|c| c.is_ascii_uppercase() || c == '_')
+                .unwrap_or(false)
+        {
             return true;
         }
     }
     false
+}
+
+/// File-name-only heuristic: `test_*.<ext>`, `*_test.<ext>`, `*.test.<ext>`, `*.spec.<ext>`, `*_spec.<ext>`.
+fn is_test_file_name(file_name: &str) -> bool {
+    if file_name.is_empty() {
+        return false;
+    }
+    let (stem, ext) = match file_name.rfind('.') {
+        Some(idx) => (&file_name[..idx], &file_name[idx + 1..]),
+        None => (file_name, ""),
+    };
+    if ext.is_empty() || stem.is_empty() {
+        return false;
+    }
+    stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with(".test")
+        || stem.ends_with(".spec")
+        || stem.ends_with("_spec")
 }
 
 /// Execute hybrid search (BM25 FTS5 + AST symbol match + cosine vector similarity) fused via RRF.
@@ -306,6 +335,19 @@ fn compute_ranks(scores: &HashMap<String, f64>) -> HashMap<String, usize> {
     ranks
 }
 
+/// `snapshot_policy` value: fail when the active snapshot is stale.
+pub const SNAPSHOT_POLICY_REQUIRE_CURRENT: &str = "require_current";
+/// `snapshot_policy` value: proceed on a stale snapshot and report a limitation (default).
+pub const SNAPSHOT_POLICY_ALLOW_STALE: &str = "allow_stale";
+/// Backwards-compatible alias of `require_current`.
+pub const SNAPSHOT_POLICY_REQUIRE_CURRENT_STRICT: &str = "require_current_strict";
+/// Default `token_budget` for `context_build`.
+pub const CONTEXT_DEFAULT_TOKEN_BUDGET: usize = 4000;
+/// Smallest accepted `token_budget` (smaller requests are clamped up).
+pub const CONTEXT_MIN_TOKEN_BUDGET: usize = 64;
+/// Largest accepted `token_budget` (larger requests are clamped down).
+pub const CONTEXT_MAX_TOKEN_BUDGET: usize = 128_000;
+
 /// Build a token-budgeted, deduplicated context package using hybrid retrieval + 1-hop graph neighborhood expansion.
 pub fn context_build(
     store: &ForgeStore,
@@ -315,16 +357,44 @@ pub fn context_build(
     let (ws, snap, freshness, changed_files) =
         store.check_workspace_freshness(&req.workspace_id)?;
 
-    if req.snapshot_policy.as_deref() == Some("require_current_strict")
-        && freshness == Freshness::Stale
-    {
+    // Snapshot policy contract:
+    //   - "require_current" (alias: "require_current_strict"): error when the snapshot is stale.
+    //   - "allow_stale" or omitted: proceed; a staleness limitation is appended below.
+    //   - anything else: error "unknown snapshot_policy".
+    let policy = req
+        .snapshot_policy
+        .as_deref()
+        .unwrap_or(SNAPSHOT_POLICY_ALLOW_STALE);
+    let require_current = match policy {
+        SNAPSHOT_POLICY_REQUIRE_CURRENT | SNAPSHOT_POLICY_REQUIRE_CURRENT_STRICT => true,
+        SNAPSHOT_POLICY_ALLOW_STALE => false,
+        other => {
+            return Err(anyhow!(
+                "unknown snapshot_policy '{}' (expected one of: {}, {}, {})",
+                other,
+                SNAPSHOT_POLICY_REQUIRE_CURRENT,
+                SNAPSHOT_POLICY_ALLOW_STALE,
+                SNAPSHOT_POLICY_REQUIRE_CURRENT_STRICT
+            ));
+        }
+    };
+    if require_current && freshness == Freshness::Stale {
         return Err(anyhow!(
-            "Workspace snapshot {} is stale and snapshot_policy=require_current_strict",
-            snap.snapshot_id
+            "Workspace snapshot {} is stale and snapshot_policy={} (changed files on disk: {})",
+            snap.snapshot_id,
+            policy,
+            changed_files.join(", ")
         ));
     }
 
-    let token_budget = req.token_budget.unwrap_or(4000).clamp(64, 128_000);
+    // Same filter semantics as code_search, re-applied to graph-expanded neighbors below.
+    let lang_filter = req.language.as_ref().map(|l| l.to_ascii_lowercase());
+    let prefix_filter = req.path_prefix.as_ref().map(|p| p.replace('\\', "/"));
+
+    let token_budget = req
+        .token_budget
+        .unwrap_or(CONTEXT_DEFAULT_TOKEN_BUDGET)
+        .clamp(CONTEXT_MIN_TOKEN_BUDGET, CONTEXT_MAX_TOKEN_BUDGET);
     let include_tests = req.include_tests.unwrap_or(true);
 
     let search_env = code_search(
@@ -497,10 +567,19 @@ pub fn context_build(
         ) else {
             continue;
         };
-        if !include_tests
-            && is_test_path_or_symbol(&chunk.file_path, chunk.symbol_name.as_deref())
+        if !include_tests && is_test_path_or_symbol(&chunk.file_path, chunk.symbol_name.as_deref())
         {
             continue;
+        }
+        if let Some(ref lf) = lang_filter {
+            if &chunk.language.to_ascii_lowercase() != lf {
+                continue;
+            }
+        }
+        if let Some(ref pf) = prefix_filter {
+            if !chunk.file_path.starts_with(pf) && !chunk.file_path.contains(pf) {
+                continue;
+            }
         }
         let key = (
             chunk.file_path.clone(),
@@ -637,4 +716,67 @@ pub fn context_build(
         budget_truncated,
         None,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_test_path_or_symbol;
+
+    #[test]
+    fn test_is_test_path_does_not_match_latest_prefix() {
+        // Regression (H5): "latest_build.rs" contains the substring "test_" but is not a test file.
+        assert!(!is_test_path_or_symbol(
+            "src/latest_build.rs",
+            Some("build_latest")
+        ));
+        assert!(!is_test_path_or_symbol("src/latest_build.rs", None));
+        // "contest" contains "test" but is not a test directory or file.
+        assert!(!is_test_path_or_symbol(
+            "src/contest_rules.rs",
+            Some("contest_rule_count")
+        ));
+        assert!(!is_test_path_or_symbol("src/contest/rules.rs", None));
+        assert!(!is_test_path_or_symbol(
+            "src/latest_tests_summary/report.rs",
+            None
+        ));
+    }
+
+    #[test]
+    fn test_is_test_path_matches_test_dirs_and_files() {
+        assert!(is_test_path_or_symbol("tests/auth_test.rs", None));
+        assert!(is_test_path_or_symbol("tests/foo.rs", None));
+        assert!(is_test_path_or_symbol("pkg/test/foo.go", None));
+        assert!(is_test_path_or_symbol("src/__tests__/foo.js", None));
+        assert!(is_test_path_or_symbol("spec/models/user_spec.rb", None));
+        assert!(is_test_path_or_symbol("src/auth_test.rs", None));
+        assert!(is_test_path_or_symbol("src/router_test.go", None));
+        assert!(is_test_path_or_symbol("src/test_pipeline.py", None));
+        assert!(is_test_path_or_symbol("src/gateway.test.ts", None));
+        assert!(is_test_path_or_symbol("src/gateway.spec.ts", None));
+        assert!(is_test_path_or_symbol("src/gateway_spec.js", None));
+        assert!(is_test_path_or_symbol("src\\tests\\win.rs", None));
+    }
+
+    #[test]
+    fn test_is_test_symbol_prefixes() {
+        assert!(is_test_path_or_symbol("src/auth.rs", Some("test_verify")));
+        assert!(is_test_path_or_symbol(
+            "src/auth.rs",
+            Some("auth::test_verify")
+        ));
+        assert!(is_test_path_or_symbol(
+            "src/router.go",
+            Some("TestDispatch")
+        ));
+        assert!(!is_test_path_or_symbol("src/router.go", Some("Tester")));
+        assert!(!is_test_path_or_symbol(
+            "src/auth.rs",
+            Some("latest_verify")
+        ));
+        assert!(!is_test_path_or_symbol(
+            "src/auth.rs",
+            Some("verify_hmac_token")
+        ));
+    }
 }

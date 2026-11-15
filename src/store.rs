@@ -11,6 +11,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+/// One indexed file: (relative path, absolute path, language, content, content hash).
+pub type WorkspaceFileRecord = (String, PathBuf, String, String, String);
+
+/// Result of resolving a symbol by id/name: the chosen symbol, other
+/// candidates that also matched, and human-readable notes about fallbacks.
+#[derive(Debug, Clone)]
+pub struct ResolvedSymbol {
+    pub symbol: Symbol,
+    pub alternatives: Vec<Symbol>,
+    pub notes: Vec<String>,
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -284,6 +296,10 @@ impl ForgeStore {
         let mut builder = WalkBuilder::new(root_path);
         builder
             .hidden(false)
+            // `ignore` defaults to `require_git(true)`, which silently disables `.gitignore`
+            // handling when the workspace root is not a git repository. Forge must honor
+            // `.gitignore` regardless of VCS presence.
+            .require_git(false)
             .git_ignore(true)
             .git_global(false)
             .git_exclude(true)
@@ -331,9 +347,7 @@ impl ForgeStore {
     }
 
     /// Compute SHA-256 hashes for all workspace source files and an aggregate root hash.
-    pub fn compute_workspace_state(
-        root_path: &Path,
-    ) -> Result<(String, Vec<(String, PathBuf, String, String, String)>)> {
+    pub fn compute_workspace_state(root_path: &Path) -> Result<(String, Vec<WorkspaceFileRecord>)> {
         let discovered = Self::collect_workspace_files(root_path)?;
         let mut file_records = Vec::with_capacity(discovered.len());
         let mut root_hasher = Sha256::new();
@@ -399,7 +413,13 @@ impl ForgeStore {
         let workspace_id = req.workspace_id.clone().unwrap_or_else(|| {
             let slug: String = repo_name
                 .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
                 .collect();
             let short_hash = &sha256_hex(root_str.as_bytes())[..8];
             format!("{}-{}", slug.trim_matches('-'), short_hash)
@@ -520,7 +540,11 @@ impl ForgeStore {
 
             let line_count = content.lines().count().max(1);
             let fv = FileVersion {
-                file_id: format!("file-{}-{}", &snapshot_id, &sha256_hex(rel_path.as_bytes())[..10]),
+                file_id: format!(
+                    "file-{}-{}",
+                    snapshot_id,
+                    &sha256_hex(rel_path.as_bytes())[..10]
+                ),
                 snapshot_id: snapshot_id.clone(),
                 workspace_id: workspace_id.clone(),
                 file_path: rel_path,
@@ -573,7 +597,7 @@ impl ForgeStore {
                 if rel.to_symbol_id.is_none() {
                     let lookup_name = rel
                         .to_name
-                        .rsplit(|c| c == ':' || c == '.' || c == '/')
+                        .rsplit([':', '.', '/'])
                         .next()
                         .unwrap_or(&rel.to_name);
                     if let Some(candidates) = symbols_by_name.get(lookup_name) {
@@ -603,6 +627,9 @@ impl ForgeStore {
         let mut chunk_embeddings: Vec<(String, String, usize, String)> =
             Vec::with_capacity(all_chunks.len());
         for chunk in &all_chunks {
+            if self.is_job_cancelled(&job_id) {
+                return Err(self.abort_cancelled_job(&job_id, total_files));
+            }
             let text_for_embed = if let Some(sym_name) = &chunk.symbol_name {
                 format!("{} {}\n{}", chunk.file_path, sym_name, chunk.content)
             } else {
@@ -634,7 +661,7 @@ impl ForgeStore {
         };
 
         // Write everything in a single SQLite transaction
-        self.with_conn_mut(|conn| {
+        let committed = self.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
 
             tx.execute(
@@ -889,18 +916,33 @@ impl ForgeStore {
                 )?;
             }
 
+            // Last cancellation checkpoint: dropping the transaction rolls back the snapshot.
+            if self.is_job_cancelled(&job_id) {
+                return Ok(false);
+            }
+            // Mark the job completed atomically with the snapshot so a concurrent
+            // job_cancel cannot overwrite a committed snapshot's job as cancelled.
+            tx.execute(
+                r#"
+                UPDATE jobs
+                SET status = ?2, progress_pct = 100, processed_files = ?3,
+                    snapshot_id = ?4, error = NULL, updated_at = ?5
+                WHERE job_id = ?1
+                "#,
+                params![
+                    job_id,
+                    JobStatusState::Completed.as_str(),
+                    total_files as i64,
+                    snapshot_id,
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
             tx.commit()?;
-            Ok(())
+            Ok(true)
         })?;
-
-        self.update_job_status(
-            &job_id,
-            JobStatusState::Completed,
-            100,
-            total_files,
-            Some(snapshot_id.clone()),
-            None,
-        )?;
+        if !committed {
+            return Err(self.abort_cancelled_job(&job_id, total_files));
+        }
 
         let open_res = WorkspaceOpenResult {
             workspace_id: workspace_id.clone(),
@@ -979,7 +1021,12 @@ impl ForgeStore {
                 },
             )
             .optional()?
-            .ok_or_else(|| anyhow!("Workspace '{}' not found. Call workspace_open first.", workspace_id))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Workspace '{}' not found. Call workspace_open first.",
+                    workspace_id
+                )
+            })
         })
     }
 
@@ -1134,7 +1181,11 @@ impl ForgeStore {
         ))
     }
 
-    pub fn get_file_content(&self, snapshot_id: &str, file_path: &str) -> Result<Option<(String, String)>> {
+    pub fn get_file_content(
+        &self,
+        snapshot_id: &str,
+        file_path: &str,
+    ) -> Result<Option<(String, String)>> {
         self.with_conn(|conn| {
             conn.query_row(
                 "SELECT content, content_hash FROM file_versions WHERE snapshot_id = ?1 AND file_path = ?2",
@@ -1146,16 +1197,27 @@ impl ForgeStore {
         })
     }
 
-    pub fn find_symbols(
-        &self,
-        req: &SymbolFindRequest,
-    ) -> Result<ResponseEnvelope<SymbolFindHit>> {
+    pub fn find_symbols(&self, req: &SymbolFindRequest) -> Result<ResponseEnvelope<SymbolFindHit>> {
         let (ws, snap, freshness, changed_files) =
             self.check_workspace_freshness(&req.workspace_id)?;
         let limit = req.limit.unwrap_or(50).clamp(1, 500);
         let mode = req.match_mode.unwrap_or_default();
         let query_lower = req.name.to_ascii_lowercase();
-        let kind_filter = req.kind.as_ref().map(|k| SymbolKind::from_str_lossy(k).as_str().to_string());
+        let kind_filter = match req.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+            Some(k) => Some(
+                SymbolKind::from_str_strict(k)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unknown symbol kind '{}'; expected one of: {}",
+                            k,
+                            SymbolKind::ACCEPTED_KINDS
+                        )
+                    })?
+                    .as_str()
+                    .to_string(),
+            ),
+            None => None,
+        };
         let file_filter = req.file_path.as_ref().map(|p| p.replace('\\', "/"));
         let lang_filter = req.language.as_ref().map(|l| l.to_ascii_lowercase());
 
@@ -1228,9 +1290,7 @@ impl ForgeStore {
             results.push(SymbolFindHit { symbol: sym });
         }
 
-        let mut limitations = vec![
-            "Symbols extracted syntactically via Tree-sitter.".to_string(),
-        ];
+        let mut limitations = vec!["Symbols extracted syntactically via Tree-sitter.".to_string()];
         if freshness == Freshness::Stale {
             limitations.push(format!(
                 "Snapshot is stale; modified files: {}",
@@ -1256,12 +1316,13 @@ impl ForgeStore {
         let (ws, snap, freshness, changed_files) =
             self.check_workspace_freshness(&req.workspace_id)?;
 
-        let sym = self.resolve_symbol_in_snapshot(
+        let resolved = self.resolve_symbol_candidates(
             &snap.snapshot_id,
             req.symbol_id.as_deref(),
             req.name.as_deref(),
             req.file_path.as_deref(),
         )?;
+        let sym = resolved.symbol;
 
         let (file_content, _) = self
             .get_file_content(&snap.snapshot_id, &sym.file_path)?
@@ -1309,6 +1370,33 @@ impl ForgeStore {
             limitations.push(format!(
                 "Snapshot is stale; modified files: {}",
                 changed_files.join(", ")
+            ));
+        }
+        limitations.extend(resolved.notes);
+        if !resolved.alternatives.is_empty() {
+            let others: Vec<String> = resolved
+                .alternatives
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} ({} {}:{}, {})",
+                        s.qualified_name,
+                        s.kind.as_str(),
+                        s.file_path,
+                        s.source_range.start_line,
+                        s.symbol_id
+                    )
+                })
+                .collect();
+            limitations.push(format!(
+                "Ambiguous symbol name '{}': {} candidates matched; returned {} ({} {}:{}). Other candidates: {}. Pass symbol_id, file_path, or a qualified name to disambiguate.",
+                req.name.as_deref().unwrap_or(&sym.name),
+                resolved.alternatives.len() + 1,
+                sym.qualified_name,
+                sym.kind.as_str(),
+                sym.file_path,
+                sym.source_range.start_line,
+                others.join("; ")
             ));
         }
 
@@ -1371,9 +1459,8 @@ impl ForgeStore {
                 ORDER BY file_path ASC, start_line ASC
                 "#,
             )?;
-            let rows = stmt.query_map(
-                params![snap.snapshot_id, search_name, target_id],
-                |row| {
+            let rows =
+                stmt.query_map(params![snap.snapshot_id, search_name, target_id], |row| {
                     Ok(Reference {
                         reference_id: row.get(0)?,
                         snapshot_id: row.get(1)?,
@@ -1395,8 +1482,7 @@ impl ForgeStore {
                         resolution_kind: ResolutionKind::from_str_lossy(&row.get::<_, String>(15)?),
                         content_hash: row.get(16)?,
                     })
-                },
-            )?;
+                })?;
             let mut list = Vec::new();
             for r in rows {
                 list.push(r?);
@@ -1404,27 +1490,69 @@ impl ForgeStore {
             Ok(list)
         })?;
 
+        // Optional file_path restricts hits to that file (in addition to
+        // disambiguating the target symbol above).
+        let norm_fp = req.file_path.as_deref().map(|p| p.replace('\\', "/"));
+        let mut refs: Vec<Reference> = refs
+            .into_iter()
+            .filter(|r| match &norm_fp {
+                Some(fp) => &r.file_path == fp || r.file_path.ends_with(fp),
+                None => true,
+            })
+            .collect();
+
+        // include_declarations: prepend the declaration site from the symbols table.
+        let include_decl = req.include_declarations.unwrap_or(false);
+        let mut decl_ref: Option<Reference> = None;
+        if include_decl {
+            if let Some(sym) = target_sym.as_ref() {
+                let in_file = match &norm_fp {
+                    Some(fp) => &sym.file_path == fp || sym.file_path.ends_with(fp),
+                    None => true,
+                };
+                if in_file {
+                    let context_line = sym.signature.lines().next().unwrap_or("").to_string();
+                    decl_ref = Some(Reference {
+                        reference_id: format!("decl-{}", sym.symbol_id),
+                        snapshot_id: snap.snapshot_id.clone(),
+                        workspace_id: ws.workspace_id.clone(),
+                        symbol_name: sym.name.clone(),
+                        target_symbol_id: Some(sym.symbol_id.clone()),
+                        file_path: sym.file_path.clone(),
+                        source_range: sym.source_range,
+                        context_line,
+                        reference_kind: "declaration".to_string(),
+                        enclosing_symbol_id: sym.parent_symbol_id.clone(),
+                        resolution_kind: ResolutionKind::Heuristic,
+                        content_hash: sym.content_hash.clone(),
+                    });
+                }
+            }
+        }
+        if let Some(d) = decl_ref {
+            refs.insert(0, d);
+        }
+
         let truncated = refs.len() > limit;
         let now = Utc::now().to_rfc3339();
         let mut results = Vec::new();
         let mut evidence = Vec::new();
 
         for r in refs.into_iter().take(limit) {
-            let surrounding_context = if let Ok(Some((fc, _))) =
-                self.get_file_content(&snap.snapshot_id, &r.file_path)
-            {
-                let lines: Vec<&str> = fc.lines().collect();
-                let line_idx = r.source_range.start_line.saturating_sub(1);
-                let s = line_idx.saturating_sub(1);
-                let e = (line_idx + 2).min(lines.len());
-                if s < e {
-                    lines[s..e].join("\n")
+            let surrounding_context =
+                if let Ok(Some((fc, _))) = self.get_file_content(&snap.snapshot_id, &r.file_path) {
+                    let lines: Vec<&str> = fc.lines().collect();
+                    let line_idx = r.source_range.start_line.saturating_sub(1);
+                    let s = line_idx.saturating_sub(1);
+                    let e = (line_idx + 2).min(lines.len());
+                    if s < e {
+                        lines[s..e].join("\n")
+                    } else {
+                        r.context_line.clone()
+                    }
                 } else {
                     r.context_line.clone()
-                }
-            } else {
-                r.context_line.clone()
-            };
+                };
 
             let enclosing_symbol_name = if let Some(ref enc_id) = r.enclosing_symbol_id {
                 self.get_symbol_by_id(&snap.snapshot_id, enc_id)?
@@ -1440,7 +1568,11 @@ impl ForgeStore {
                 file_path: r.file_path.clone(),
                 source_range: r.source_range,
                 content_hash: r.content_hash.clone(),
-                producer: "forge-tree-sitter-reference-extractor".to_string(),
+                producer: if r.reference_kind == "declaration" {
+                    "forge-tree-sitter-symbol-reader".to_string()
+                } else {
+                    "forge-tree-sitter-reference-extractor".to_string()
+                },
                 resolution_kind: r.resolution_kind,
                 observed_at: now.clone(),
             });
@@ -1499,47 +1631,123 @@ impl ForgeStore {
         name: Option<&str>,
         file_path: Option<&str>,
     ) -> Result<Symbol> {
+        self.resolve_symbol_candidates(snapshot_id, symbol_id, name, file_path)
+            .map(|r| r.symbol)
+    }
+
+    /// Resolve a symbol by id or name, returning the chosen symbol plus any
+    /// other candidates that matched (so callers can report ambiguity).
+    ///
+    /// Candidate ranking when a name matches several symbols:
+    /// 1. `file_path` filter (exact or suffix match, `\` normalized to `/`).
+    /// 2. Definitions (multi-line bodies) before single-line declarations
+    ///    such as trait method signatures.
+    /// 3. Stable order by (file_path, start_line).
+    pub fn resolve_symbol_candidates(
+        &self,
+        snapshot_id: &str,
+        symbol_id: Option<&str>,
+        name: Option<&str>,
+        file_path: Option<&str>,
+    ) -> Result<ResolvedSymbol> {
+        let mut notes = Vec::new();
         if let Some(sid) = symbol_id {
             if let Some(sym) = self.get_symbol_by_id(snapshot_id, sid)? {
-                return Ok(sym);
+                return Ok(ResolvedSymbol {
+                    symbol: sym,
+                    alternatives: Vec::new(),
+                    notes,
+                });
             }
+            if name.is_none() {
+                return Err(anyhow!(
+                    "Symbol '{}' not found in snapshot {}",
+                    sid,
+                    snapshot_id
+                ));
+            }
+            notes.push(format!(
+                "symbol_id '{}' not found in snapshot {}; fell back to name lookup",
+                sid, snapshot_id
+            ));
         }
-        if let Some(nm) = name {
-            let norm_fp = file_path.map(|p| p.replace('\\', "/"));
-            let syms = self.with_conn(|conn| {
-                let mut stmt = conn.prepare(
-                    r#"
-                    SELECT symbol_id, snapshot_id, workspace_id, repository_id, name, qualified_name,
-                           kind, language, file_path, start_line, start_column, end_line, end_column,
-                           start_byte, end_byte, signature, doc_comment, parent_symbol_id, visibility, content_hash
-                    FROM symbols
-                    WHERE snapshot_id = ?1 AND (name = ?2 OR qualified_name = ?2)
-                    ORDER BY file_path ASC, start_line ASC
-                    "#,
-                )?;
-                let rows = stmt.query_map(params![snapshot_id, nm], Self::map_symbol_row)?;
-                let mut v = Vec::new();
-                for r in rows {
-                    v.push(r?);
-                }
-                Ok(v)
-            })?;
+        let nm = match name {
+            Some(nm) if !nm.trim().is_empty() => nm,
+            _ => {
+                return Err(anyhow!(
+                    "Symbol lookup requires 'symbol_id' or 'name' (neither was provided)"
+                ))
+            }
+        };
 
-            if let Some(ref fp) = norm_fp {
-                if let Some(found) = syms.iter().find(|s| &s.file_path == fp || s.file_path.ends_with(fp)) {
-                    return Ok(found.clone());
+        let norm_fp = file_path.map(|p| p.replace('\\', "/"));
+        let syms = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT symbol_id, snapshot_id, workspace_id, repository_id, name, qualified_name,
+                       kind, language, file_path, start_line, start_column, end_line, end_column,
+                       start_byte, end_byte, signature, doc_comment, parent_symbol_id, visibility, content_hash
+                FROM symbols
+                WHERE snapshot_id = ?1 AND (name = ?2 OR qualified_name = ?2)
+                ORDER BY file_path ASC, start_line ASC
+                "#,
+            )?;
+            let rows = stmt.query_map(params![snapshot_id, nm], Self::map_symbol_row)?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })?;
+
+        let mut candidates: Vec<Symbol> = match norm_fp {
+            Some(ref fp) => {
+                let filtered: Vec<Symbol> = syms
+                    .iter()
+                    .filter(|s| &s.file_path == fp || s.file_path.ends_with(fp.as_str()))
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    if !syms.is_empty() {
+                        notes.push(format!(
+                            "No symbol named '{}' in file '{}'; fell back to workspace-wide lookup",
+                            nm, fp
+                        ));
+                    }
+                    syms
+                } else {
+                    filtered
                 }
             }
-            if let Some(first) = syms.into_iter().next() {
-                return Ok(first);
+            None => syms,
+        };
+
+        if candidates.is_empty() {
+            return Err(anyhow!(
+                "Symbol '{}' not found in snapshot {}{}",
+                nm,
+                snapshot_id,
+                file_path
+                    .map(|p| format!(" (file_path={})", p))
+                    .unwrap_or_default()
+            ));
+        }
+
+        // Prefer definitions with bodies over one-line declarations; keep (file_path, start_line) order otherwise.
+        let is_definition = |s: &Symbol| s.source_range.end_line > s.source_range.start_line;
+        if let Some(pos) = candidates.iter().position(is_definition) {
+            if pos != 0 {
+                let chosen = candidates.remove(pos);
+                candidates.insert(0, chosen);
             }
         }
-        Err(anyhow!(
-            "Symbol not found in snapshot {} (symbol_id={:?}, name={:?})",
-            snapshot_id,
-            symbol_id,
-            name
-        ))
+
+        let symbol = candidates.remove(0);
+        Ok(ResolvedSymbol {
+            symbol,
+            alternatives: candidates,
+            notes,
+        })
     }
 
     pub fn list_snapshot_symbols(&self, snapshot_id: &str) -> Result<Vec<Symbol>> {
@@ -1631,10 +1839,7 @@ impl ForgeStore {
         })
     }
 
-    pub fn list_snapshot_embeddings(
-        &self,
-        snapshot_id: &str,
-    ) -> Result<HashMap<String, Vec<f32>>> {
+    pub fn list_snapshot_embeddings(&self, snapshot_id: &str) -> Result<HashMap<String, Vec<f32>>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT chunk_id, embedding_json FROM vector_embeddings WHERE snapshot_id = ?1",
@@ -1840,18 +2045,17 @@ impl ForgeStore {
         } else {
             return Err(anyhow!("Provide job_id or workspace_id for job_status"));
         };
-        let (snapshot_id, freshness) = if let Ok((_, snap, fresh, _)) =
-            self.check_workspace_freshness(&job.workspace_id)
-        {
-            (snap.snapshot_id, fresh)
-        } else {
-            (
-                job.snapshot_id
-                    .clone()
-                    .unwrap_or_else(|| "none".to_string()),
-                Freshness::Current,
-            )
-        };
+        let (snapshot_id, freshness) =
+            if let Ok((_, snap, fresh, _)) = self.check_workspace_freshness(&job.workspace_id) {
+                (snap.snapshot_id, fresh)
+            } else {
+                (
+                    job.snapshot_id
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string()),
+                    Freshness::Current,
+                )
+            };
         let now = Utc::now().to_rfc3339();
         let evidence = vec![Evidence {
             repository_id: format!("repo-{}", job.workspace_id),
@@ -1876,13 +2080,30 @@ impl ForgeStore {
     }
 
     pub fn cancel_job(&self, req: &JobCancelRequest) -> Result<ResponseEnvelope<JobRecord>> {
-        {
-            if let Ok(mut set) = self.cancelled_jobs.lock() {
-                set.insert(req.job_id.clone());
-            }
+        // Signal cancellation before touching the DB: get_job may block on the connection
+        // mutex while the indexer's write transaction runs, and the indexer re-checks this
+        // set just before committing.
+        if let Ok(mut set) = self.cancelled_jobs.lock() {
+            set.insert(req.job_id.clone());
         }
-        let mut job = self.get_job(&req.job_id)?;
+        let unsignal = || {
+            if let Ok(mut set) = self.cancelled_jobs.lock() {
+                set.remove(&req.job_id);
+            }
+        };
+        let mut job = match self.get_job(&req.job_id) {
+            Ok(job) => job,
+            Err(e) => {
+                unsignal();
+                return Err(e);
+            }
+        };
+        let mut limitations = Vec::new();
         if matches!(job.status, JobStatusState::Queued | JobStatusState::Running) {
+            limitations.push(
+                "Cancellation requested; indexing stops at the next file boundary and no snapshot is activated."
+                    .to_string(),
+            );
             self.update_job_status(
                 &job.job_id,
                 JobStatusState::Cancelled,
@@ -1892,6 +2113,12 @@ impl ForgeStore {
                 Some("Cancelled via job_cancel".to_string()),
             )?;
             job = self.get_job(&req.job_id)?;
+        } else {
+            unsignal();
+            limitations.push(format!(
+                "Job already {}; nothing to cancel.",
+                job.status.as_str()
+            ));
         }
         let snapshot_id = job
             .snapshot_id
@@ -1914,10 +2141,26 @@ impl ForgeStore {
             Freshness::Current,
             vec![job],
             evidence,
-            vec![],
+            limitations,
             false,
             None,
         ))
+    }
+
+    /// Record a cancellation observed after file parsing finished and build the error
+    /// returned to the workspace_open caller.
+    fn abort_cancelled_job(&self, job_id: &str, total_files: usize) -> anyhow::Error {
+        if let Err(e) = self.update_job_status(
+            job_id,
+            JobStatusState::Cancelled,
+            100,
+            total_files,
+            None,
+            Some("Job cancelled by user".to_string()),
+        ) {
+            return e;
+        }
+        anyhow!("Indexing job {} was cancelled", job_id)
     }
 
     pub fn is_job_cancelled(&self, job_id: &str) -> bool {

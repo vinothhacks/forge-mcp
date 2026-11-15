@@ -31,7 +31,7 @@ pub fn estimate_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    let char_est = (text.len() + 3) / 4;
+    let char_est = text.len().div_ceil(4);
     let word_est = text.split_whitespace().count();
     char_est.max(word_est).max(1)
 }
@@ -210,17 +210,27 @@ impl SymbolKind {
         }
     }
 
-    pub fn from_str_lossy(s: &str) -> Self {
+    /// Accepted spellings for `kind` filters, listed in error messages.
+    pub const ACCEPTED_KINDS: &'static str =
+        "function, struct, class, interface, method, trait, module (aliases: fn, func, def, enum, mod, package, namespace)";
+
+    /// Strict parse: returns `None` for unknown kinds instead of guessing.
+    /// `enum` aliases to `Struct` because the parser indexes `enum_item` as `Struct`.
+    pub fn from_str_strict(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "function" | "fn" | "func" | "def" => SymbolKind::Function,
-            "struct" => SymbolKind::Struct,
-            "class" => SymbolKind::Class,
-            "interface" => SymbolKind::Interface,
-            "method" => SymbolKind::Method,
-            "trait" => SymbolKind::Trait,
-            "module" | "mod" | "package" | "namespace" => SymbolKind::Module,
-            _ => SymbolKind::Function,
+            "function" | "fn" | "func" | "def" => Some(SymbolKind::Function),
+            "struct" | "enum" => Some(SymbolKind::Struct),
+            "class" => Some(SymbolKind::Class),
+            "interface" => Some(SymbolKind::Interface),
+            "method" => Some(SymbolKind::Method),
+            "trait" => Some(SymbolKind::Trait),
+            "module" | "mod" | "package" | "namespace" => Some(SymbolKind::Module),
+            _ => None,
         }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        Self::from_str_strict(s).unwrap_or(SymbolKind::Function)
     }
 }
 
@@ -509,16 +519,12 @@ pub struct CodeSearchHit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum MatchMode {
     Exact,
     Prefix,
+    #[default]
     Substring,
-}
-
-impl Default for MatchMode {
-    fn default() -> Self {
-        MatchMode::Substring
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
