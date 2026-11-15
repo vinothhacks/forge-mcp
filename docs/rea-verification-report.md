@@ -1,6 +1,9 @@
 # Forge — Capability Specification & REA MCP Verification Report
 
-**Project**: Forge (`forge-mcp` / `@forge-mcp/server` v0.1.0)  
+> **Superseded (2026-11-15).** This report describes the Oct 26 build. The code changed afterwards, and every feature was re-verified from the current source. See [verification/README.md](verification/README.md) for the current results, including the defects found and fixed.
+
+
+**Project**: Forge (`forge-mcp` / `forge-codebase-mcp` v0.1.0)  
 **Date**: 2026-10-26  
 **Status**: Verified (100% of Rust unit/E2E tests, stdio/HTTP transport E2E tests, npm CLI wrapper E2E tests, and REA artifact inspections completed).
 
@@ -12,7 +15,7 @@ Forge is a self-hosted Rust codebase-search and code-intelligence MCP server uni
 
 This document records:
 1. **Implementation-Neutral Capability Specifications** across all 11 exposed MCP tools and 4 capability layers, including provenance, resolution classification (`compiler_resolved`, `heuristic`, `unresolved`), freshness policies, and language boundaries.
-2. **REA MCP Artifact Verification Evidence** across the compiled Windows PE32+ binary (`target/release/forge-mcp.exe`), the persistent SQLite + FTS5 + Vector index database (`.forge/verify-index.db`), and the `@forge-mcp/server` Node.js CLI/SDK wrapper (`npm/`).
+2. **REA MCP Artifact Verification Evidence** across the compiled Windows PE32+ binary (`target/release/forge-mcp.exe`), the persistent SQLite + FTS5 + Vector index database (`.forge/verify-index.db`), and the `forge-codebase-mcp` Node.js CLI/SDK wrapper (`npm/`).
 3. **End-to-End Test Results** across Rust (`tests/e2e_test.rs`), local `stdio` (newline-delimited and `Content-Length` framed JSON-RPC 2.0), self-hosted Axum HTTP (`GET /health`, `POST /mcp` with Bearer authentication and workspace path allowlisting), and the npm CLI wrapper (`npm/test/e2e.test.js`).
 
 ---
@@ -167,7 +170,7 @@ All 11 secondary B-tree indices (`idx_file_versions_snapshot`, `idx_symbols_snap
 
 ### 3.3 NPM JavaScript Application Verification (`npm/`)
 
-The `@forge-mcp/server` Node.js package (`D:\research 1\mcp\codebase\npm`) was reconstructed and verified using `user-rea:analyze_javascript_application` and `user-rea:inspect_analysis_view`.
+The `forge-codebase-mcp` Node.js package (`D:\research 1\mcp\codebase\npm`) was reconstructed and verified using `user-rea:analyze_javascript_application` and `user-rea:inspect_analysis_view`.
 
 - **Summary Evidence ID**: `ev_c7320e96df88960bc799a273d82d54e9bbe28a9da2372109f62fd8a086d08ab1`
 - **Parent Evidence ID**: `ev_6222672f8ab2f75c63405fd1607ef255bae75874fb700ddfb65a58c5bbb7e11d`

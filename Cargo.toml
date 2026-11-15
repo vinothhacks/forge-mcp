@@ -5,6 +5,13 @@ edition = "2021"
 description = "Forge — Self-Hosted Rust Codebase Search and Intelligence MCP Server"
 license = "MIT"
 authors = ["Forge Contributors"]
+repository = "https://github.com/vinothhacks/forge-mcp"
+homepage = "https://github.com/vinothhacks/forge-mcp"
+documentation = "https://github.com/vinothhacks/forge-mcp#readme"
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "code-search", "tree-sitter", "code-intelligence"]
+categories = ["command-line-utilities", "development-tools"]
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md"]
 
 [[bin]]
 name = "forge-mcp"
@@ -44,3 +51,8 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3.12"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
