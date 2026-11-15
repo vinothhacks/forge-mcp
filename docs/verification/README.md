@@ -40,10 +40,18 @@ Integrated binary (F16, Windows x64 release): `ad6e633d9d3e83be8590bf844898ad9eb
 | `npm pack` | 6 files: `bin/`, `lib/`, `index.js`, `README.md`, `package.json` |
 | Tarball installed in a clean folder, binary downloaded from a local release mirror | download verified against `SHA256SUMS`, cached, second run used the cache, MCP handshake succeeded |
 
+## Continuous integration and release rehearsal
+
+| Check | Result |
+|---|---|
+| GitHub Actions CI (fmt, clippy, version check, Rust and npm tests) | green on Ubuntu, Windows and macOS |
+| Release rehearsal tag `v0.1.0-rc.1` | binaries built for all five targets, pre-release published with `SHA256SUMS`, registry publishes skipped as designed |
+| npm tarball installed in a clean folder, binary downloaded from the real `v0.1.0-rc.1` release | download verified and cached; MCP handshake and all 11 tools listed |
+
 ## Not covered here
 
-- Linux and macOS binaries are built and tested by CI on GitHub Actions, not on this machine.
-- The `@modelcontextprotocol/inspector` CLI could not be run (no network); a Node client exercised the same handshake.
+- Linux and macOS binaries were built and tested in CI; only the Windows binary was run interactively on this machine.
+- The `@modelcontextprotocol/inspector` CLI could not be run (no network at the time); a Node client exercised the same handshake.
 - REA binary inspection was unavailable; SQLite contents were checked with `node:sqlite`.
 
 Known limitations that were documented rather than changed are listed in each phase report and in the root README's Security section.
