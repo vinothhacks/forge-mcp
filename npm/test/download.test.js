@@ -138,26 +138,38 @@ describe('release binary download', () => {
     }
   });
 
-  test('resolveBinaryPath downloads into the cache when nothing local exists', () => {
-    const { resolveBinaryPath } = require('../index.js');
+  test('resolveBinaryPath downloads into the cache when nothing local exists', (t) => {
+    const { resolveBinaryPath, findBinaryInPath, getBinaryName } = require('../index.js');
+    // Keep the real PATH: the download step needs `tar` on Linux and macOS.
+    const realPath = process.env.PATH || process.env.Path || '';
+    if (findBinaryInPath(getBinaryName(), { PATH: realPath })) {
+      t.skip('forge-mcp is already on PATH, so resolution would never reach the download step');
+      return;
+    }
     const empty = path.join(tmp, 'empty-root');
     fs.mkdirSync(empty, { recursive: true });
     const cache = path.join(tmp, 'cache-resolve');
     const env = {
-      PATH: '',
+      PATH: realPath,
       FORGE_MCP_CACHE_DIR: cache,
       FORGE_MCP_RELEASE_BASE_URL: baseUrl,
       FORGE_MCP_RELEASE_TAG: TAG
     };
     const chunks = [];
-    const resolved = resolveBinaryPath({
-      env,
-      version: VERSION,
-      packageRoot: empty,
-      workspaceRoot: empty,
-      autoBuild: false,
-      stderr: { write: (c) => chunks.push(String(c)) }
-    });
+    let resolved;
+    try {
+      resolved = resolveBinaryPath({
+        env,
+        version: VERSION,
+        packageRoot: empty,
+        workspaceRoot: empty,
+        autoBuild: false,
+        stderr: { write: (c) => chunks.push(String(c)) }
+      });
+    } catch (err) {
+      err.message += `\n--- download output ---\n${chunks.join('')}`;
+      throw err;
+    }
     assert.equal(resolved, getCachedBinaryPath({ version: VERSION, env }));
     assert.equal(fs.readFileSync(resolved, 'utf8'), STUB);
     assert.match(chunks.join(''), /installed/);
