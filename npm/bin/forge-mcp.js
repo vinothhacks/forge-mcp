@@ -5,7 +5,7 @@ const path = require('node:path');
 const { resolveBinaryPath, spawnForgeServer } = require('../index.js');
 
 /**
- * CLI entrypoint for `@forge-mcp/server`.
+ * CLI entrypoint for `forge-codebase-mcp`.
  * Resolves (or builds) the native `forge-mcp` binary and spawns it,
  * forwarding all CLI arguments, environment variables, stdio streams,
  * and termination signals without polluting stdout.

@@ -48,6 +48,13 @@ Integrated binary (F16, Windows x64 release): `ad6e633d9d3e83be8590bf844898ad9eb
 | Release rehearsal tag `v0.1.0-rc.1` | binaries built for all five targets, pre-release published with `SHA256SUMS`, registry publishes skipped as designed |
 | npm tarball installed in a clean folder, binary downloaded from the real `v0.1.0-rc.1` release | download verified and cached; MCP handshake and all 11 tools listed |
 
+## After the v0.1.0 release
+
+| Check | Result |
+|---|---|
+| Real `v0.1.0` Windows binary downloaded by the npm wrapper from GitHub Releases | checksum verified; `--version` prints `forge-mcp 0.1.0`; `workspace_open`, `symbol_find`, `symbol_references`, `code_search` and `context_build` return results |
+| npm resolution-order test (F14 scope) | FAIL-FIXED. Once the real release existed, the test used the home download cache and downloaded from GitHub, so it failed on Windows and on any machine with a cached binary. It now uses a private cache dir with downloads disabled, and also checks the cache step's position in the order. Proven by running old and new tests against a pre-filled home cache: old fails, new passes. |
+
 ## Not covered here
 
 - Linux and macOS binaries were built and tested in CI; only the Windows binary was run interactively on this machine.

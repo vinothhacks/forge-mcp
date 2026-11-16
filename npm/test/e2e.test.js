@@ -14,6 +14,8 @@ const {
   spawnForgeServer,
   ForgeMcpClient
 } = require('../index.js');
+const { getCachedBinaryPath } = require('../lib/platform.js');
+const PACKAGE_VERSION = require('../package.json').version;
 
 /**
  * Allocates an available local TCP port on 127.0.0.1.
@@ -417,7 +419,7 @@ async function exerciseFullToolSuite(client, fixtureDir) {
   assertValidEnvelope(jobRes, 'job_status');
 }
 
-describe('@forge-mcp/server E2E suite', () => {
+describe('forge-codebase-mcp E2E suite', () => {
   let fixtureDir;
   let resolvedBin;
 
@@ -618,27 +620,35 @@ describe('@forge-mcp/server E2E suite', () => {
   });
 });
 
-describe('@forge-mcp/server offline regressions', () => {
+describe('forge-codebase-mcp offline regressions', () => {
   const { findBinaryInPath, normalizeToolResult, parseHttpRpcBody } = require('../index.js');
 
-  test('resolveBinaryPath order: explicit > bundled > release > debug > PATH (never builds)', () => {
+  test('resolveBinaryPath order: explicit > bundled > release > debug > cache > PATH (never builds or downloads)', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mcp-resolve-'));
     const binName = getBinaryName();
     const npmRoot = path.join(root, 'npmroot');
     const wsRoot = path.join(root, 'wsroot');
     const pathDir = path.join(root, 'pathdir');
     const emptyDir = path.join(root, 'empty');
+    // A private cache and no downloads: the user's ~/.forge-mcp cache and the
+    // published GitHub release must never leak into this test.
+    const baseEnv = {
+      PATH: pathDir,
+      FORGE_MCP_CACHE_DIR: path.join(root, 'cache'),
+      FORGE_MCP_SKIP_DOWNLOAD: '1'
+    };
     const bundled = path.join(npmRoot, 'bin', 'native', binName);
     const release = path.join(wsRoot, 'target', 'release', binName);
     const debug = path.join(wsRoot, 'target', 'debug', binName);
+    const cached = getCachedBinaryPath({ version: PACKAGE_VERSION, env: baseEnv });
     const onPath = path.join(pathDir, binName);
-    for (const file of [bundled, release, debug, onPath]) {
+    for (const file of [bundled, release, debug, cached, onPath]) {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, 'stub', 'utf8');
     }
     fs.mkdirSync(emptyDir, { recursive: true });
     // No Cargo.toml + autoBuild:false guarantees the cargo build step is never reached
-    const base = { packageRoot: npmRoot, workspaceRoot: wsRoot, autoBuild: false, env: { PATH: pathDir } };
+    const base = { packageRoot: npmRoot, workspaceRoot: wsRoot, autoBuild: false, env: baseEnv };
 
     try {
       assert.ok(!fs.existsSync(path.join(wsRoot, 'Cargo.toml')));
@@ -646,11 +656,11 @@ describe('@forge-mcp/server offline regressions', () => {
       const fromEnv = path.join(root, 'env', binName);
       assert.equal(resolveBinaryPath({ ...base, binPath: explicit }), path.resolve(explicit));
       assert.equal(
-        resolveBinaryPath({ ...base, env: { PATH: pathDir, FORGE_MCP_BIN: fromEnv } }),
+        resolveBinaryPath({ ...base, env: { ...baseEnv, FORGE_MCP_BIN: fromEnv } }),
         path.resolve(fromEnv)
       );
       assert.equal(
-        resolveBinaryPath({ ...base, binPath: explicit, env: { PATH: pathDir, FORGE_MCP_BIN: fromEnv } }),
+        resolveBinaryPath({ ...base, binPath: explicit, env: { ...baseEnv, FORGE_MCP_BIN: fromEnv } }),
         path.resolve(explicit),
         'binPath option should take precedence over FORGE_MCP_BIN'
       );
@@ -660,12 +670,14 @@ describe('@forge-mcp/server offline regressions', () => {
       fs.unlinkSync(release);
       assert.equal(resolveBinaryPath(base), path.resolve(debug));
       fs.unlinkSync(debug);
+      assert.equal(resolveBinaryPath(base), path.resolve(cached));
+      fs.unlinkSync(cached);
       assert.equal(resolveBinaryPath(base), path.resolve(onPath));
 
       assert.throws(
-        () => resolveBinaryPath({ ...base, env: { PATH: emptyDir } }),
+        () => resolveBinaryPath({ ...base, env: { ...baseEnv, PATH: emptyDir } }),
         (err) => {
-          for (const fragment of ['FORGE_MCP_BIN', bundled, release, debug, 'system PATH']) {
+          for (const fragment of ['FORGE_MCP_BIN', bundled, release, debug, cached, 'system PATH', 'download skipped']) {
             assert.ok(err.message.includes(fragment), `error should mention ${fragment}: ${err.message}`);
           }
           return true;
@@ -675,7 +687,7 @@ describe('@forge-mcp/server offline regressions', () => {
         () =>
           resolveBinaryPath({
             ...base,
-            env: { FORGE_MCP_BIN: path.join(root, 'missing', binName) },
+            env: { ...baseEnv, FORGE_MCP_BIN: path.join(root, 'missing', binName) },
             mustExist: true
           }),
         /non-existent file/
@@ -837,7 +849,7 @@ describe('@forge-mcp/server offline regressions', () => {
     test('real forge-mcp binary exits with code 0 on close()', async (t) => {
       let binPath;
       try {
-        binPath = resolveBinaryPath({ autoBuild: false, mustExist: true });
+        binPath = resolveBinaryPath({ autoBuild: false, autoDownload: false, mustExist: true });
       } catch (_) {
         t.skip('forge-mcp binary not available (set FORGE_MCP_BIN)');
         return;
