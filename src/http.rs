@@ -57,7 +57,11 @@ pub async fn run_http_server(
     auth_token: Option<String>,
 ) -> Result<()> {
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-    if !addr.ip().is_loopback() && !auth_token.as_deref().is_some_and(|token| !token.trim().is_empty()) {
+    if !addr.ip().is_loopback()
+        && !auth_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+    {
         anyhow::bail!("Set FORGE_AUTH_TOKEN before binding the HTTP transport beyond loopback");
     }
     let app = build_http_router(mcp, auth_token);
