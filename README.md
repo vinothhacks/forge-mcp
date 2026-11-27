@@ -1,8 +1,6 @@
 # Forge: codebase search and code intelligence for coding agents
 
 [![CI](https://github.com/vinothhacks/forge-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/vinothhacks/forge-mcp/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/forge-mcp.svg)](https://crates.io/crates/forge-mcp)
-[![npm](https://img.shields.io/npm/v/forge-codebase-mcp.svg)](https://www.npmjs.com/package/forge-codebase-mcp)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Forge is a self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server that gives coding agents
@@ -17,32 +15,30 @@ index, and exposes eleven tools for search, symbol navigation, call graphs, chan
 
 ## Install
 
-Pick one. All three give you the same `forge-mcp` binary.
-
-| Method | Command | Needs |
-|---|---|---|
-| npx (recommended) | `npx -y forge-codebase-mcp --version` | Node.js 18+ |
-| Cargo | `cargo install forge-mcp --locked` | Rust toolchain |
-| Prebuilt binary | Download from [Releases](https://github.com/vinothhacks/forge-mcp/releases) | nothing |
-
-The npm package downloads the matching prebuilt binary from GitHub Releases on first run, verifies it against the
-release `SHA256SUMS`, and caches it in `~/.forge-mcp`. Prebuilt binaries exist for Windows x64, Linux x64/arm64 and
-macOS x64/arm64.
-
-Prebuilt binary by hand:
+Download the archive for your platform and `SHA256SUMS` from the same [GitHub release](https://github.com/vinothhacks/forge-mcp/releases).
+Check the archive before extracting it. Release assets are available for Windows x64, Linux x64/arm64,
+and macOS x64/arm64. A Rust toolchain can also build the tagged source.
 
 ```bash
-# Linux / macOS (pick your target from the Releases page)
-curl -L https://github.com/vinothhacks/forge-mcp/releases/latest/download/SHA256SUMS -o SHA256SUMS
-curl -LO https://github.com/vinothhacks/forge-mcp/releases/download/v0.1.0/forge-mcp-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf forge-mcp-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+# Linux x64 example. For macOS choose the matching Darwin asset and use shasum -a 256.
+base=https://github.com/vinothhacks/forge-mcp/releases/download/v0.1.0
+asset=forge-mcp-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO "$base/$asset" &&
+  curl -fLO "$base/SHA256SUMS" &&
+  grep -F "  $asset" SHA256SUMS | sha256sum --check &&
+  tar -xzf "$asset" &&
+  "./${asset%.tar.gz}/forge-mcp" --version
 ```
 
 ```powershell
-# Windows
-Invoke-WebRequest https://github.com/vinothhacks/forge-mcp/releases/download/v0.1.0/forge-mcp-v0.1.0-x86_64-pc-windows-msvc.zip -OutFile forge-mcp.zip
-tar -xf forge-mcp.zip
+$base = 'https://github.com/vinothhacks/forge-mcp/releases/download/v0.1.0'
+$asset = 'forge-mcp-v0.1.0-x86_64-pc-windows-msvc.zip'
+Invoke-WebRequest "$base/$asset" -OutFile $asset
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
+$expected = ((Select-String -Path SHA256SUMS -SimpleMatch "  $asset").Line -split '\s+')[0]
+if ((Get-FileHash $asset -Algorithm SHA256).Hash -ne $expected) { throw 'Checksum mismatch' }
+Expand-Archive $asset -DestinationPath .
+& '.\forge-mcp-v0.1.0-x86_64-pc-windows-msvc\forge-mcp.exe' --version
 ```
 
 ## Connect your coding agent
@@ -53,7 +49,7 @@ absolute `--db-path`. Forge only opens workspaces under the `--allow-root` direc
 ### Claude Code
 
 ```bash
-claude mcp add forge -- npx -y forge-codebase-mcp --transport stdio --allow-root /abs/path/to/repo --db-path ~/.forge-mcp/index.db
+claude mcp add forge -- /abs/path/to/forge-mcp --transport stdio --allow-root /abs/path/to/repo --db-path ~/.forge-mcp/index.db
 ```
 
 ### Cursor (`.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`), Claude Desktop (`claude_desktop_config.json`)
@@ -62,9 +58,8 @@ claude mcp add forge -- npx -y forge-codebase-mcp --transport stdio --allow-root
 {
   "mcpServers": {
     "forge": {
-      "command": "npx",
+      "command": "/abs/path/to/forge-mcp",
       "args": [
-        "-y", "forge-codebase-mcp",
         "--transport", "stdio",
         "--allow-root", "/abs/path/to/repo",
         "--db-path", "/abs/path/to/forge-index.db"
@@ -74,8 +69,7 @@ claude mcp add forge -- npx -y forge-codebase-mcp --transport stdio --allow-root
 }
 ```
 
-On Windows, GUI apps sometimes cannot find `npx`. Use `"command": "cmd"` with `"args": ["/c", "npx", "-y", "forge-codebase-mcp", ...]`,
-or point `"command"` at the downloaded `forge-mcp.exe`.
+On Windows, point `"command"` at the downloaded `forge-mcp.exe` and escape backslashes in the JSON.
 
 ### VS Code (`.vscode/mcp.json`)
 
@@ -84,16 +78,12 @@ or point `"command"` at the downloaded `forge-mcp.exe`.
   "servers": {
     "forge": {
       "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "forge-codebase-mcp", "--transport", "stdio", "--allow-root", "${workspaceFolder}", "--db-path", "${userHome}/.forge-mcp/index.db"]
+      "command": "/abs/path/to/forge-mcp",
+      "args": ["--transport", "stdio", "--allow-root", "${workspaceFolder}", "--db-path", "${userHome}/.forge-mcp/index.db"]
     }
   }
 }
 ```
-
-### Installed with Cargo or a prebuilt binary
-
-Use `"command": "forge-mcp"` (or the full path to the binary) with the same arguments, minus `-y forge-codebase-mcp`.
 
 ### First call
 
@@ -102,8 +92,8 @@ Ask the agent to call `workspace_open` with the repository path. It returns a `w
 ## Self-hosted HTTP
 
 ```bash
-forge-mcp --transport http --host 0.0.0.0 --port 8080 \
-  --auth-token "$FORGE_AUTH_TOKEN" \
+# Set FORGE_AUTH_TOKEN in the process environment before starting the server.
+forge-mcp --transport http --host 127.0.0.1 --port 8080 \
   --allow-root /srv/repos \
   --db-path /var/lib/forge/index.db
 ```
@@ -117,7 +107,7 @@ forge-mcp --transport http --host 0.0.0.0 --port 8080 \
 Connect Claude Code to it:
 
 ```bash
-claude mcp add --transport http forge http://your-host:8080/mcp --header "Authorization: Bearer $FORGE_AUTH_TOKEN"
+claude mcp add --transport http forge http://127.0.0.1:8080/mcp --header "Authorization: Bearer $FORGE_AUTH_TOKEN"
 ```
 
 ## Tools
