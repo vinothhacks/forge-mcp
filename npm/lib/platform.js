@@ -26,7 +26,7 @@ function getTargetTriple(platform = process.platform, arch = process.arch) {
   if (!triple) {
     throw new Error(
       `forge-mcp has no prebuilt binary for ${platform}/${arch}. ` +
-        'Install from source with "cargo install forge-mcp --locked" and set FORGE_MCP_BIN, or put forge-mcp on PATH.'
+        'Build from a source checkout with "cargo build --release --locked" and set FORGE_MCP_BIN, or put forge-mcp on PATH.'
     );
   }
   return triple;
