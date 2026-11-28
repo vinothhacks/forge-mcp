@@ -24,13 +24,13 @@ if (cargoVersion !== npmVersion) {
 }
 
 const ref = process.env.GITHUB_REF_NAME || '';
-if (/^v\d/.test(ref)) {
-  const tagVersion = ref.slice(1);
-  // A pre-release tag such as v0.1.0-rc.1 rehearses the release of 0.1.0:
-  // it builds binaries and a GitHub pre-release but publishes nothing to registries.
-  const tagBase = tagVersion.split('-')[0];
-  const isPrerelease = tagVersion.includes('-');
-  if (tagVersion !== cargoVersion && !(isPrerelease && tagBase === cargoVersion)) {
+const refType = process.env.GITHUB_REF_TYPE;
+if (refType === 'tag' || (!refType && /^v\d/.test(ref))) {
+  const tag = /^v(\d+\.\d+\.\d+)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(ref);
+  if (!tag) {
+    problems.push('release tag must have the form vX.Y.Z or vX.Y.Z-rc.N');
+  } else if (ref.slice(1) !== cargoVersion && tag[1] !== cargoVersion) {
+    // A prerelease can rehearse a stable version without changing the manifests.
     problems.push(`tag ${ref} does not match Cargo.toml version ${cargoVersion}`);
   }
 }
