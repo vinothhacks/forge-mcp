@@ -6,63 +6,68 @@ Node.js CLI wrapper and programmatic SDK for the **Forge Codebase Search and Int
 
 ---
 
-## Features
+Install Forge from a verified GitHub release archive. The native binary runs on its own, and the Node.js
+wrapper can launch it from a local source checkout or provide a programmatic client.
 
-- **Seamless CLI Launcher (`forge-mcp`)**: Resolves, downloads, or builds the native Rust `forge-mcp` binary and forwards all CLI flags, environment variables, `stdio` streams, and signals (`SIGINT`, `SIGTERM`).
-- **Local `stdio` Transport**: Launch directly from Cursor, Claude Desktop, OpenCode, or any MCP host via `npx forge-codebase-mcp`.
-- **Self-Hosted `http` Transport**: Run a multi-workspace HTTP JSON-RPC server with optional Bearer token authentication and canonicalized workspace root allowlists.
-- **Programmatic Node.js Client (`ForgeMcpClient`)**: Built-in client supporting both `stdio` and `http` transports with helpers for `initialize()`, `listTools()`, `callTool()`, and `close()`.
+## Install
 
----
+Follow the Windows PowerShell or Linux/macOS sh commands in the
+[Forge installation guide](https://github.com/vinothhacks/forge-mcp#install) to verify the archive against the
+same release's `SHA256SUMS` before extraction. Windows x64 passed clean-install first use. The Linux x64,
+Linux arm64, macOS x64 and macOS arm64 archives have checksum verification only.
 
-## Quick Start (`npx` / MCP Client Configuration)
+The `forge-codebase-mcp` wrapper and `forge-mcp` crate are unpublished. The npm package named `forge-mcp`
+belongs to the unrelated Hermes Forge project. The wrapper has no npm dependencies to install.
 
-### 1. Local `stdio` Mode
+## Use the wrapper from a local checkout
 
-Add Forge to your MCP configuration (e.g. `.cursor/mcp.json` or `claude_desktop_config.json`):
+### Local stdio
+
+For a client such as Cursor or Claude Desktop, give Node.js the absolute path to the wrapper and set
+`FORGE_MCP_BIN` to the verified native binary. Run the [first-use fixture check](https://github.com/vinothhacks/forge-mcp#first-use)
+to confirm the connection and search.
 
 ```json
 {
   "mcpServers": {
     "forge": {
-      "command": "npx",
+      "command": "node",
       "args": [
-        "-y",
-        "forge-codebase-mcp",
+        "/abs/path/to/forge-mcp/npm/bin/forge-mcp.js",
         "--transport",
         "stdio",
         "--allow-root",
-        "/path/to/your/workspace"
-      ]
+        "/abs/path/to/fixture",
+        "--db-path",
+        "/abs/path/to/forge-index.db"
+      ],
+      "env": {
+        "FORGE_MCP_BIN": "/abs/path/to/forge-mcp-binary",
+        "FORGE_MCP_SKIP_DOWNLOAD": "1"
+      }
     }
   }
 }
 ```
 
-Or run directly from a local checkout:
+### Self-hosted HTTP
+
+Set `FORGE_AUTH_TOKEN` in the process environment. With `FORGE_MCP_BIN` pointing to the verified binary,
+run this from the checkout root:
 
 ```bash
-node ./npm/bin/forge-mcp.js --transport stdio --allow-root /path/to/your/workspace
-```
-
----
-
-### 2. Self-Hosted HTTP Mode
-
-Start the Forge HTTP server with Bearer authentication and an allowlisted workspace root:
-
-```bash
-npx forge-codebase-mcp \
+node ./npm/bin/forge-mcp.js \
   --transport http \
-  --host 0.0.0.0 \
+  --host 127.0.0.1 \
   --port 8080 \
-  --auth-token "your-secret-bearer-token" \
-  --allow-root /srv/repositories
+  --allow-root /srv/repositories \
+  --db-path /var/lib/forge/index.db
 ```
 
-Endpoints exposed in HTTP mode:
-- `POST http://<host>:<port>/mcp` — MCP JSON-RPC 2.0 / Streamable HTTP endpoint
-- `GET http://<host>:<port>/health` — Health check endpoint
+`POST /mcp` with an initialize request returns 401 without a Bearer token and 200 with the configured
+token. `GET /health` is unauthenticated. Always configure a token before binding off-loopback. The
+unreleased native binary enforces this, including for blank tokens. The published v0.1.0 binary relies
+on the operator to set the token.
 
 ---
 
@@ -76,20 +81,22 @@ When `forge-mcp` or `resolveBinaryPath()` runs, it locates `forge-mcp` (or `forg
 4. A previously downloaded release binary in `~/.forge-mcp/bin/<version>/<target>/` (override with `FORGE_MCP_CACHE_DIR`)
 5. System `PATH`
 6. Download the matching binary from [GitHub Releases](https://github.com/vinothhacks/forge-mcp/releases), verify it against the release `SHA256SUMS`, and cache it. Set `FORGE_MCP_SKIP_DOWNLOAD=1` to disable; `FORGE_MCP_RELEASE_BASE_URL` and `FORGE_MCP_RELEASE_TAG` point it at a mirror or another release.
-7. Automatic source build via `cargo build --release` if `Cargo.toml` exists in the parent directory (all compiler output is directed to `stderr` so `stdio` JSON-RPC `stdout` is never polluted)
+7. Automatic source build via `cargo build --release --locked` if `Cargo.toml` exists in the parent directory (compiler output goes to `stderr` to keep `stdout` available for MCP)
 
-Prebuilt binaries exist for Windows x64, Linux x64/arm64 and macOS x64/arm64. On other platforms, install with `cargo install forge-mcp --locked`.
+For another platform, try `cargo build --release --locked` from the tagged source checkout.
 
 ---
 
 ## Programmatic Node.js API
+
+Run this example in an async function from the checkout root. Set `FORGE_MCP_BIN` to the verified binary.
 
 ```js
 const {
   resolveBinaryPath,
   spawnForgeServer,
   ForgeMcpClient
-} = require('forge-codebase-mcp');
+} = require('./npm');
 
 // 1. Resolve native binary path
 const binPath = resolveBinaryPath();
@@ -108,8 +115,9 @@ const openRes = await stdioClient.callTool('workspace_open', {
 });
 console.log('Snapshot ID:', openRes.snapshot_id);
 
+const workspaceId = openRes.results[0].workspace_id;
 const searchRes = await stdioClient.callTool('code_search', {
-  workspace_id: openRes.results.workspace_id,
+  workspace_id: workspaceId,
   query: 'authentication middleware'
 });
 console.log('Search results:', searchRes.results);
@@ -124,8 +132,9 @@ const httpClient = new ForgeMcpClient({
 });
 
 await httpClient.initialize();
+const httpOpenRes = await httpClient.callTool('workspace_open', { path: process.cwd() });
 const statusRes = await httpClient.callTool('workspace_status', {
-  workspace_id: openRes.results.workspace_id
+  workspace_id: httpOpenRes.results[0].workspace_id
 });
 await httpClient.close();
 ```

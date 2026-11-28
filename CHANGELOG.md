@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Require a nonblank Bearer token before the HTTP server binds off-loopback.
+- Upgrade bundled SQLite, `url` and `rustix` to versions with RustSec fixes.
+- Pin workflow actions to commit SHAs, restrict workflow credentials and add a blocking Rust dependency audit.
+- Verify release tags are reachable from `main`, smoke-test every extracted archive and publish a stable checksum manifest. Registry publication requires a separate manual dispatch and approval environment.
+
+### Changed
+
+- Document checksum-verified GitHub archives as the install path. Report clean-install evidence for Windows x64 and checksum-only evidence for Linux and macOS.
+- Use the Cargo lockfile for release builds. The crate and npm wrapper are unpublished, so wrapper diagnostics point to the verified archive or a source build.
+
 ## [0.1.0] - 2026-11-16
 
 ### Added
