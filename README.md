@@ -1,8 +1,6 @@
 # Forge: codebase search and code intelligence for coding agents
 
 [![CI](https://github.com/vinothhacks/forge-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/vinothhacks/forge-mcp/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/forge-mcp.svg)](https://crates.io/crates/forge-mcp)
-[![npm](https://img.shields.io/npm/v/forge-codebase-mcp.svg)](https://www.npmjs.com/package/forge-codebase-mcp)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Forge is a self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server that gives coding agents
@@ -17,33 +15,66 @@ index, and exposes eleven tools for search, symbol navigation, call graphs, chan
 
 ## Install
 
-Pick one. All three give you the same `forge-mcp` binary.
+Use a fresh download directory. Download the archive for your platform and `SHA256SUMS` from
+[GitHub Release v0.1.0](https://github.com/vinothhacks/forge-mcp/releases/tag/v0.1.0) and verify the archive
+before extracting it. Clean-install first use was verified on Windows x64. Linux x64, Linux arm64,
+macOS x64 and macOS arm64 have checksum verification only.
 
-| Method | Command | Needs |
-|---|---|---|
-| npx (recommended) | `npx -y forge-codebase-mcp --version` | Node.js 18+ |
-| Cargo | `cargo install forge-mcp --locked` | Rust toolchain |
-| Prebuilt binary | Download from [Releases](https://github.com/vinothhacks/forge-mcp/releases) | nothing |
-
-The npm package downloads the matching prebuilt binary from GitHub Releases on first run, verifies it against the
-release `SHA256SUMS`, and caches it in `~/.forge-mcp`. Prebuilt binaries exist for Windows x64, Linux x64/arm64 and
-macOS x64/arm64.
-
-Prebuilt binary by hand:
-
-```bash
-# Linux / macOS (pick your target from the Releases page)
-curl -L https://github.com/vinothhacks/forge-mcp/releases/latest/download/SHA256SUMS -o SHA256SUMS
-curl -LO https://github.com/vinothhacks/forge-mcp/releases/download/v0.1.0/forge-mcp-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf forge-mcp-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-```
+### Windows x64 (PowerShell)
 
 ```powershell
-# Windows
-Invoke-WebRequest https://github.com/vinothhacks/forge-mcp/releases/download/v0.1.0/forge-mcp-v0.1.0-x86_64-pc-windows-msvc.zip -OutFile forge-mcp.zip
-tar -xf forge-mcp.zip
+$ErrorActionPreference = 'Stop'
+$base = 'https://github.com/vinothhacks/forge-mcp/releases/download/v0.1.0'
+$asset = 'forge-mcp-v0.1.0-x86_64-pc-windows-msvc.zip'
+Invoke-WebRequest -UseBasicParsing "$base/$asset" -OutFile $asset
+Invoke-WebRequest -UseBasicParsing "$base/SHA256SUMS" -OutFile SHA256SUMS
+$pattern = '^[0-9a-fA-F]{64}  ' + [regex]::Escape($asset) + '$'
+$entry = @(Get-Content -LiteralPath SHA256SUMS | Where-Object { $_ -cmatch $pattern })
+if ($entry.Count -ne 1) { throw 'Expected one checksum for this archive' }
+if ((Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash -ne $entry[0].Substring(0, 64)) {
+    throw 'Checksum mismatch'
+}
+Expand-Archive -LiteralPath $asset -DestinationPath .
+& '.\forge-mcp-v0.1.0-x86_64-pc-windows-msvc\forge-mcp.exe' --version
 ```
+
+### Linux and macOS (sh)
+
+```sh
+(
+  set -eu
+  base=https://github.com/vinothhacks/forge-mcp/releases/download/v0.1.0
+  os=$(uname -s)
+  arch=$(uname -m)
+  case "$os/$arch" in
+    Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+    Linux/aarch64) target=aarch64-unknown-linux-gnu ;;
+    Darwin/x86_64) target=x86_64-apple-darwin ;;
+    Darwin/arm64) target=aarch64-apple-darwin ;;
+    *) echo "No published archive for $os/$arch" >&2; exit 1 ;;
+  esac
+  asset=forge-mcp-v0.1.0-$target.tar.gz
+  curl -fLO "$base/$asset"
+  curl -fLO "$base/SHA256SUMS"
+  expected=$(awk -v asset="$asset" '
+    NF == 2 && $2 == asset && length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ {
+      print tolower($1)
+      count++
+    }
+    END { if (count != 1) exit 1 }
+  ' SHA256SUMS) || { echo 'Expected one checksum for this archive' >&2; exit 1; }
+  if [ "$os" = Linux ]; then hash_line=$(sha256sum "$asset")
+  else hash_line=$(shasum -a 256 "$asset"); fi
+  actual=${hash_line%% *}
+  [ "$actual" = "$expected" ] || { echo 'Checksum mismatch' >&2; exit 1; }
+  tar -xzf "$asset"
+  "./${asset%.tar.gz}/forge-mcp" --version
+)
+```
+
+The `forge-mcp` crate and `forge-codebase-mcp` npm wrapper are unpublished. The npm package named
+`forge-mcp` belongs to the unrelated Hermes Forge project. To build from source, check out the `v0.1.0`
+tag and run `cargo build --release --locked` from the repository root. The binary is in `target/release/`.
 
 ## Connect your coding agent
 
@@ -53,7 +84,7 @@ absolute `--db-path`. Forge only opens workspaces under the `--allow-root` direc
 ### Claude Code
 
 ```bash
-claude mcp add forge -- npx -y forge-codebase-mcp --transport stdio --allow-root /abs/path/to/repo --db-path ~/.forge-mcp/index.db
+claude mcp add forge -- /abs/path/to/forge-mcp --transport stdio --allow-root /abs/path/to/repo --db-path ~/.forge-mcp/index.db
 ```
 
 ### Cursor (`.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`), Claude Desktop (`claude_desktop_config.json`)
@@ -62,9 +93,8 @@ claude mcp add forge -- npx -y forge-codebase-mcp --transport stdio --allow-root
 {
   "mcpServers": {
     "forge": {
-      "command": "npx",
+      "command": "/abs/path/to/forge-mcp",
       "args": [
-        "-y", "forge-codebase-mcp",
         "--transport", "stdio",
         "--allow-root", "/abs/path/to/repo",
         "--db-path", "/abs/path/to/forge-index.db"
@@ -74,8 +104,7 @@ claude mcp add forge -- npx -y forge-codebase-mcp --transport stdio --allow-root
 }
 ```
 
-On Windows, GUI apps sometimes cannot find `npx`. Use `"command": "cmd"` with `"args": ["/c", "npx", "-y", "forge-codebase-mcp", ...]`,
-or point `"command"` at the downloaded `forge-mcp.exe`.
+On Windows, point `"command"` at the downloaded `forge-mcp.exe` and escape backslashes in the JSON.
 
 ### VS Code (`.vscode/mcp.json`)
 
@@ -84,26 +113,31 @@ or point `"command"` at the downloaded `forge-mcp.exe`.
   "servers": {
     "forge": {
       "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "forge-codebase-mcp", "--transport", "stdio", "--allow-root", "${workspaceFolder}", "--db-path", "${userHome}/.forge-mcp/index.db"]
+      "command": "/abs/path/to/forge-mcp",
+      "args": ["--transport", "stdio", "--allow-root", "${workspaceFolder}", "--db-path", "${userHome}/.forge-mcp/index.db"]
     }
   }
 }
 ```
 
-### Installed with Cargo or a prebuilt binary
+### First use
 
-Use `"command": "forge-mcp"` (or the full path to the binary) with the same arguments, minus `-y forge-codebase-mcp`.
-
-### First call
-
-Ask the agent to call `workspace_open` with the repository path. It returns a `workspace_id`; every other tool takes it.
+1. Create a disposable directory with a `fixture.py` file containing `def academy_fixture_hello(): return "hello"`.
+   Set `--allow-root` to that directory and `--db-path` to a new database path outside it.
+2. Connect over stdio. Send `initialize` with `protocolVersion` set to `2024-11-05`, then send
+   `notifications/initialized` and call `tools/list`. Expect server name `forge-mcp` and 11 tools.
+3. Call `workspace_open` with the absolute fixture `path`. Pass the returned `results[0].workspace_id`
+   to `code_search` with `query` set to `academy_fixture_hello`. Expect a result for `fixture.py`.
+4. For HTTP, start on `127.0.0.1` with a throwaway `FORGE_AUTH_TOKEN` set in the server environment.
+   `POST /mcp` with an `initialize` request returns 401 without a token and 200 with
+   `Authorization: Bearer <token>`. The unreleased build also refuses off-loopback binds with a missing
+   or blank token. The published v0.1.0 binary requires you to set the token yourself before binding off-loopback.
 
 ## Self-hosted HTTP
 
 ```bash
-forge-mcp --transport http --host 0.0.0.0 --port 8080 \
-  --auth-token "$FORGE_AUTH_TOKEN" \
+# Set FORGE_AUTH_TOKEN in the process environment before starting the server.
+forge-mcp --transport http --host 127.0.0.1 --port 8080 \
   --allow-root /srv/repos \
   --db-path /var/lib/forge/index.db
 ```
@@ -117,7 +151,7 @@ forge-mcp --transport http --host 0.0.0.0 --port 8080 \
 Connect Claude Code to it:
 
 ```bash
-claude mcp add --transport http forge http://your-host:8080/mcp --header "Authorization: Bearer $FORGE_AUTH_TOKEN"
+claude mcp add --transport http forge http://127.0.0.1:8080/mcp --header "Authorization: Bearer $FORGE_AUTH_TOKEN"
 ```
 
 ## Tools
@@ -145,7 +179,7 @@ Relationships come from Tree-sitter syntax, so they are labelled `heuristic` (or
 | `--transport` | `FORGE_TRANSPORT` | `stdio` | `stdio` or `http` (`sse` is an alias of `http`) |
 | `--host` | `FORGE_HOST` | `127.0.0.1` | HTTP bind address |
 | `--port` | `FORGE_PORT` | `8080` | HTTP port |
-| `--auth-token` | `FORGE_AUTH_TOKEN` | none | Bearer token for HTTP; empty disables auth |
+| `--auth-token` | `FORGE_AUTH_TOKEN` | none | Bearer token for HTTP. The unreleased build allows a blank token only on loopback. |
 | `--allow-root` | `FORGE_ALLOW_ROOT` | none | Directory workspaces must live under. Repeat the flag for several roots; the env var takes one path |
 | `--db-path` | `FORGE_DB_PATH` | `.forge/forge-index.db` | SQLite index file (relative to the working directory) |
 | `--embedding-url` | `FORGE_EMBEDDING_URL` | none | Optional OpenAI/Ollama-compatible `/v1/embeddings` endpoint; a built-in local embedder is used otherwise |
@@ -164,26 +198,28 @@ npm wrapper only:
 
 ## Security
 
+- The published v0.1.0 archive predates the bundled SQLite and `url` fixes in [Unreleased](CHANGELOG.md#unreleased).
 - Always pass `--allow-root`. Without it, a client can index any directory the process can read.
-- Set `--auth-token` whenever `--host` is not loopback. The token is also accepted as a `?token=` query parameter, which can end up in proxy logs; prefer the `Authorization` header.
+- Set `FORGE_AUTH_TOKEN` before binding HTTP off-loopback. The unreleased build enforces this requirement.
+  Use the `Authorization` header because query parameters can appear in proxy logs.
 - There is no built-in TLS. Put a reverse proxy in front for HTTPS.
 - Over HTTP, every response is also broadcast to all `/sse` subscribers. Do not share one server and token between parties who must not see each other's results.
 - The index database contains your source text. Protect it like the repository.
 
 ## Troubleshooting
 
-- **Download blocked or offline:** install with `cargo install forge-mcp --locked` and set `FORGE_MCP_BIN`, or put `forge-mcp` on `PATH`.
+- **Download blocked or offline:** use an already verified archive or build from a source checkout and set `FORGE_MCP_BIN` to the resulting binary.
 - **`no prebuilt binary for <platform>`:** build from source with Cargo.
-- **`Checksum mismatch`:** delete `~/.forge-mcp` and retry; if it repeats, the download was altered in transit.
+- **`Checksum mismatch`:** discard the download and fetch the archive and `SHA256SUMS` again from the same release. Stop if the mismatch persists.
 - **Behind a proxy (Node 24):** set `NODE_USE_ENV_PROXY=1` together with `HTTPS_PROXY`.
 - **`outside allowed roots`:** the path passed to `workspace_open` is not under any `--allow-root`.
 
 ## Development
 
 ```bash
-cargo build --release
-cargo test -- --test-threads=1
-cd npm && npm test
+cargo build --release --locked
+cargo test --locked --all-targets -- --test-threads=1
+cd npm && FORGE_MCP_SKIP_DOWNLOAD=1 npm test
 ```
 
 Verification reports for every tool and transport are in [docs/verification](docs/verification/README.md).

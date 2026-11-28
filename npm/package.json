@@ -15,7 +15,7 @@
   "scripts": {
     "start": "node ./bin/forge-mcp.js",
     "test": "node --test ./test/e2e.test.js ./test/download.test.js",
-    "build:rust": "cargo build --release --manifest-path ../Cargo.toml"
+    "build:rust": "cargo build --release --locked --manifest-path ../Cargo.toml"
   },
   "keywords": [
     "mcp",

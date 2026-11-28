@@ -2,84 +2,126 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ['v*']
+  workflow_dispatch:
 
-permissions:
-  contents: write
-  id-token: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: '2'
+  RUSTUP_TOOLCHAIN: stable
 
 jobs:
   verify-tag:
-    name: verify tag matches versions
+    name: verify tag and versions
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      revision: ${{ steps.verify.outputs.revision }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          node-version: 20
-      - run: node scripts/check-version.mjs
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Verify release source
+        id: verify
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            if [[ "$GITHUB_REF_TYPE" != tag || ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Dispatch on a stable tag with gh workflow run release.yml --ref vX.Y.Z."
+              exit 1
+            fi
+            release=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease --jq '.isDraft == false and .isPrerelease == false')
+            if [[ "$release" != true ]]; then
+              echo "::error::Registry publication requires a published stable GitHub release."
+              exit 1
+            fi
+          fi
+          revision=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
+          if ! git merge-base --is-ancestor "$revision" refs/remotes/origin/main; then
+            echo "::error::Release tag $TAG must be reachable from main."
+            exit 1
+          fi
+          if [[ "$revision" != "$(git rev-parse HEAD)" ]]; then
+            echo "::error::The release tag no longer points to the triggering revision."
+            exit 1
+          fi
+          unset GH_TOKEN
+          git checkout --detach "$revision"
+          GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$TAG" node scripts/check-version.mjs
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
   build:
     name: build ${{ matrix.target }}
     needs: verify-tag
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            archive: zip
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
-            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            archive: tar.gz
           - target: x86_64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
+            os: macos-15-intel
           - target: aarch64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
+            os: macos-15
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+          ref: ${{ needs.verify-tag.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          key: ${{ matrix.target }}
+          node-version: '24'
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package (unix)
+        run: cargo build --release --locked -j 2 --target ${{ matrix.target }}
+      - name: Package and smoke test (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          VER="${GITHUB_REF_NAME#v}"
-          NAME="forge-mcp-v${VER}-${{ matrix.target }}"
-          mkdir -p "dist/${NAME}"
-          cp "target/${{ matrix.target }}/release/forge-mcp" "dist/${NAME}/"
-          cp LICENSE README.md "dist/${NAME}/"
-          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
-          rm -rf "dist/${NAME}"
-      - name: Package (windows)
+          name="forge-mcp-$GITHUB_REF_NAME-${{ matrix.target }}"
+          mkdir -p "staging/$name" dist smoke
+          cp "target/${{ matrix.target }}/release/forge-mcp" LICENSE README.md "staging/$name/"
+          tar -C staging -czf "dist/$name.tar.gz" "$name"
+          tar -C smoke -xzf "dist/$name.tar.gz"
+          node scripts/smoke-release.mjs "smoke/$name/forge-mcp" "$GITHUB_REF_NAME"
+      - name: Package and smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $ver = $env:GITHUB_REF_NAME.TrimStart("v")
-          $name = "forge-mcp-v$ver-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/forge-mcp.exe" "dist/$name/"
-          Copy-Item LICENSE, README.md "dist/$name/"
-          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
-          Remove-Item -Recurse -Force "dist/$name"
-      - uses: actions/upload-artifact@v4
+          $ErrorActionPreference = 'Stop'
+          $name = "forge-mcp-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "staging/$name", dist, smoke | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/forge-mcp.exe", LICENSE, README.md "staging/$name/"
+          Compress-Archive -Path "staging/$name" -DestinationPath "dist/$name.zip"
+          Expand-Archive -LiteralPath "dist/$name.zip" -DestinationPath smoke
+          node scripts/smoke-release.mjs "smoke/$name/forge-mcp.exe" $env:GITHUB_REF_NAME
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
           path: dist/*
@@ -88,61 +130,97 @@ jobs:
   release:
     name: publish GitHub release
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
       - name: Checksums
         working-directory: dist
-        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          prefix="forge-mcp-$GITHUB_REF_NAME"
+          sha256sum \
+            "$prefix-aarch64-apple-darwin.tar.gz" \
+            "$prefix-aarch64-unknown-linux-gnu.tar.gz" \
+            "$prefix-x86_64-apple-darwin.tar.gz" \
+            "$prefix-x86_64-pc-windows-msvc.zip" \
+            "$prefix-x86_64-unknown-linux-gnu.tar.gz" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: dist/*
+          files: |
+            dist/SHA256SUMS
+            dist/*.tar.gz
+            dist/*.zip
+          fail_on_unmatched_files: true
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 
+  # Dispatch on the release tag to retain the tagged source revision in npm provenance.
+  # Configure required reviewers on both registry environments.
   publish-crate:
     name: publish to crates.io
-    needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
+    needs: verify-tag
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: crates-publish
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
       - name: Check token
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::error::The CARGO_REGISTRY_TOKEN secret is not set. Create a crates.io API token (publish-new, publish-update), add it under Settings > Secrets and variables > Actions, then re-run this job."
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "::error::Set CARGO_REGISTRY_TOKEN in the approved crates-publish environment."
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish --locked
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify-tag.outputs.revision }}
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo publish --locked -j 2
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-npm:
     name: publish to npm
-    needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
+    needs: verify-tag
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
       - name: Check token
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::The NPM_TOKEN secret is not set. Create an npm granular access token with publish rights (bypass 2FA), add it under Settings > Secrets and variables > Actions, then re-run this job."
+          if [[ -z "$NODE_AUTH_TOKEN" ]]; then
+            echo "::error::Set NPM_TOKEN in the approved npm-publish environment."
             exit 1
           fi
-      - name: Publish
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify-tag.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      # The npm package has no dependencies; there is nothing for npm ci to install.
+      - name: Publish with provenance
         working-directory: npm
         run: npm publish --provenance --access public
         env:

@@ -72,7 +72,7 @@ function findBinaryInPath(binName, env = process.env, platform = process.platfor
  *    `SHA256SUMS`, and cache it (skipped when `FORGE_MCP_SKIP_DOWNLOAD` is set or
  *    `options.autoDownload === false`)
  * 7) If not found and `Cargo.toml` exists in the parent workspace directory,
- *    automatically builds with `cargo build --release` (emitting all build logs
+ *    automatically builds with `cargo build --release --locked` (emitting all build logs
  *    to `stderr` so `stdio` JSON-RPC `stdout` is never polluted).
  *
  * @param {object} [options={}]
@@ -81,7 +81,7 @@ function findBinaryInPath(binName, env = process.env, platform = process.platfor
  * @param {string} [options.platform=process.platform] Target OS platform
  * @param {string} [options.packageRoot] Path to `npm/` directory
  * @param {string} [options.workspaceRoot] Path to Rust workspace root directory
- * @param {boolean} [options.autoBuild=true] Whether to run `cargo build --release` if missing
+ * @param {boolean} [options.autoBuild=true] Whether to build the binary from Cargo.lock if missing
  * @param {boolean} [options.autoDownload=true] Whether to download a release binary if missing
  * @param {string} [options.version] Release version to download (defaults to this package's version)
  * @param {boolean} [options.mustExist=false] Whether an explicit `FORGE_MCP_BIN` path must exist on disk
@@ -167,17 +167,17 @@ function resolveBinaryPath(options = {}) {
     }
   }
 
-  // 7) Automatic cargo build --release if Cargo.toml exists in parent directory
+  // 7) Automatic locked release build if Cargo.toml exists in the parent directory
   const cargoTomlPath = path.join(workspaceRoot, 'Cargo.toml');
   if (autoBuild && fs.existsSync(cargoTomlPath)) {
     if (stderr && typeof stderr.write === 'function') {
       stderr.write(
-        `[forge-mcp] Native binary not found; building from ${cargoTomlPath} with "cargo build --release"...\n`
+        `[forge-mcp] Native binary not found; building from ${cargoTomlPath} with "cargo build --release --locked"...\n`
       );
     }
 
     // Redirect both stdout and stderr from cargo to stderr so stdio JSON-RPC stdout is never polluted
-    const buildResult = spawnSync('cargo', ['build', '--release'], {
+    const buildResult = spawnSync('cargo', ['build', '--release', '--locked'], {
       cwd: workspaceRoot,
       env: { ...process.env, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -192,10 +192,10 @@ function resolveBinaryPath(options = {}) {
     }
 
     if (buildResult.error) {
-      throw new Error(`Failed to execute cargo build --release: ${buildResult.error.message}`);
+      throw new Error(`Failed to execute cargo build --release --locked: ${buildResult.error.message}`);
     }
     if (buildResult.status !== 0) {
-      throw new Error(`cargo build --release exited with status ${buildResult.status}`);
+      throw new Error(`cargo build --release --locked exited with status ${buildResult.status}`);
     }
 
     if (fs.existsSync(releaseCandidate) && fs.statSync(releaseCandidate).isFile()) {
@@ -207,7 +207,7 @@ function resolveBinaryPath(options = {}) {
     `Unable to locate "${binName}". Checked FORGE_MCP_BIN, ${bundledCandidate}, ${releaseCandidate}, ${debugCandidate}, ` +
       `${cachedCandidate || 'the download cache (unsupported platform)'}, and system PATH` +
       (skipDownload ? ' (download skipped: FORGE_MCP_SKIP_DOWNLOAD or autoDownload:false).' : '; the release download did not succeed.') +
-      ' Install with "cargo install forge-mcp --locked" or set FORGE_MCP_BIN.'
+      ' Download a verified GitHub release archive or build from source with "cargo build --release --locked", then set FORGE_MCP_BIN.'
   );
 }
 
