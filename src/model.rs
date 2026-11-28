@@ -1,6 +1,42 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub(crate) fn timestamp_now() -> String {
+    format_utc_timestamp(jiff::Timestamp::now())
+}
+
+fn format_utc_timestamp(timestamp: jiff::Timestamp) -> String {
+    // Preserve the UTC offset and fractional precision used by existing indexes.
+    let nanos = timestamp.subsec_nanosecond().unsigned_abs();
+    let precision = if nanos == 0 {
+        0
+    } else if nanos.is_multiple_of(1_000_000) {
+        3
+    } else if nanos.is_multiple_of(1_000) {
+        6
+    } else {
+        9
+    };
+    let utc = timestamp.display_with_offset(jiff::tz::Offset::UTC);
+    format!("{utc:.precision$}")
+}
+
+#[test]
+fn utc_timestamp_preserves_index_format() {
+    for (nanos, suffix) in [
+        (0, ""),
+        (100_000_000, ".100"),
+        (123_450_000, ".123450"),
+        (123_456_780, ".123456780"),
+    ] {
+        let timestamp = jiff::Timestamp::new(0, nanos).expect("timestamp within range");
+        assert_eq!(
+            format_utc_timestamp(timestamp),
+            format!("1970-01-01T00:00:00{suffix}+00:00")
+        );
+    }
+}
+
 /// Normalize a canonicalized filesystem path, stripping the Windows extended-length `\\?\` prefix
 /// so path comparisons and user-facing paths remain clean and consistent across platforms.
 pub fn normalize_canonical_path(path: &Path) -> std::io::Result<PathBuf> {

@@ -1147,7 +1147,7 @@ async fn test_http_server_auth_allowlist_and_full_tool_invocation() {
         vec![PathBuf::from(ws_dir.path())],
     ));
 
-    let secret = "forge-http-secret-token-2026".to_string();
+    let secret = uuid::Uuid::new_v4().to_string();
     let app = build_http_router(mcp, Some(secret.clone()));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1201,6 +1201,34 @@ async fn test_http_server_auth_allowlist_and_full_tool_invocation() {
         .await
         .expect("POST /mcp wrong token");
     assert_eq!(bad_token_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let ping = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+    let mcp_url = format!("{base_url}/mcp");
+    let query_auth = client
+        .post(&mcp_url)
+        .query(&[("token", &secret)])
+        .json(&ping)
+        .send()
+        .await
+        .expect("POST /mcp with query authentication");
+    assert_eq!(query_auth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    for (origin, expected) in [
+        (base_url.as_str(), reqwest::StatusCode::OK),
+        ("http://localhost:1", reqwest::StatusCode::FORBIDDEN),
+        ("https://example.invalid", reqwest::StatusCode::FORBIDDEN),
+        ("null", reqwest::StatusCode::FORBIDDEN),
+    ] {
+        let response = client
+            .post(&mcp_url)
+            .header("Origin", origin)
+            .header("Authorization", format!("BEARER {secret}"))
+            .json(&ping)
+            .send()
+            .await
+            .expect("POST /mcp with Origin");
+        assert_eq!(response.status(), expected);
+    }
 
     // 4. POST /mcp with valid Bearer token succeeds for workspace_open on allowed root
     let open_resp = client
@@ -1285,6 +1313,69 @@ async fn test_http_server_auth_allowlist_and_full_tool_invocation() {
     assert!(!results.is_empty());
 
     server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_tokenless_http_requires_loopback_host() {
+    let store = ForgeStore::open_in_memory().expect("open store");
+    let mcp = Arc::new(ForgeMcpServer::new(
+        store,
+        EmbeddingEngine::default(),
+        vec![],
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let url = format!("http://{}/mcp", listener.local_addr().expect("local addr"));
+    let app = build_http_router(mcp, None);
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve HTTP");
+    });
+    let client = reqwest::Client::new();
+    let ping = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+
+    let local = client
+        .post(&url)
+        .json(&ping)
+        .send()
+        .await
+        .expect("POST /mcp");
+    assert_eq!(local.status(), reqwest::StatusCode::OK);
+    let rejected = client
+        .post(&url)
+        .header("Host", "example.invalid")
+        .json(&ping)
+        .send()
+        .await
+        .expect("POST /mcp with non-loopback Host");
+    assert_eq!(rejected.status(), reqwest::StatusCode::FORBIDDEN);
+    server_handle.abort();
+}
+
+#[test]
+fn test_workspace_skips_oversized_files_and_rejects_file_roots() {
+    let dir = tempfile::tempdir().expect("create workspace");
+    let source_path = dir.path().join("small.rs");
+    fs::write(&source_path, "fn hello() {}").expect("write source");
+    fs::File::create(dir.path().join("large.rs"))
+        .expect("create large source")
+        .set_len(2 * 1024 * 1024 + 1)
+        .expect("set source size");
+
+    let (_, records) = ForgeStore::compute_workspace_state(dir.path()).expect("scan workspace");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, "small.rs");
+
+    let store = ForgeStore::open_in_memory().expect("open store");
+    let request = WorkspaceOpenRequest {
+        path: source_path.to_string_lossy().into_owned(),
+        workspace_id: None,
+        force_reindex: None,
+    };
+    let error = store
+        .open_workspace(&request, &EmbeddingEngine::default(), &[])
+        .expect_err("file workspace root should fail");
+    assert!(error.to_string().contains("not a directory"), "{error}");
 }
 
 #[test]

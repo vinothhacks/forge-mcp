@@ -74,7 +74,7 @@ impl ForgeMcpServer {
     }
 
     pub fn handle_jsonrpc_value(&self, req: Value) -> Option<Value> {
-        if let Some(arr) = req.as_array() {
+        if let Value::Array(arr) = req {
             // JSON-RPC 2.0 section6: an empty batch is answered with a single Invalid Request error
             if arr.is_empty() {
                 return Some(Self::err_response(
@@ -85,7 +85,7 @@ impl ForgeMcpServer {
             }
             let mut responses = Vec::new();
             for item in arr {
-                if let Some(r) = self.handle_single_request(item.clone()) {
+                if let Some(r) = self.handle_single_request(item) {
                     responses.push(r);
                 }
             }

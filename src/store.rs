@@ -2,11 +2,12 @@ use crate::embeddings::EmbeddingEngine;
 use crate::model::*;
 use crate::parser::{detect_language, parse_file_ast, ParsedFile};
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
 use ignore::WalkBuilder;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -348,20 +349,35 @@ impl ForgeStore {
 
     /// Compute SHA-256 hashes for all workspace source files and an aggregate root hash.
     pub fn compute_workspace_state(root_path: &Path) -> Result<(String, Vec<WorkspaceFileRecord>)> {
+        const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+
         let discovered = Self::collect_workspace_files(root_path)?;
         let mut file_records = Vec::with_capacity(discovered.len());
         let mut root_hasher = Sha256::new();
 
         for (rel_path, abs_path, lang) in discovered {
-            let bytes = match std::fs::read(&abs_path) {
-                Ok(b) => b,
-                Err(_) => continue,
+            let Ok(file) = File::open(&abs_path) else {
+                continue;
             };
-            // Skip oversized files (> 2MB) or binary files
-            if bytes.len() > 2 * 1024 * 1024 || bytes.contains(&0) {
+            let Ok(metadata) = file.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.len() > MAX_SOURCE_BYTES {
                 continue;
             }
-            let content = String::from_utf8_lossy(&bytes).into_owned();
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            // Bound the read even if the source grows after the metadata check.
+            if file
+                .take(MAX_SOURCE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.len() as u64 > MAX_SOURCE_BYTES
+                || bytes.contains(&0)
+            {
+                continue;
+            }
+            let content = String::from_utf8(bytes)
+                .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
             let hash = sha256_hex(content.as_bytes());
             root_hasher.update(rel_path.as_bytes());
             root_hasher.update(b":");
@@ -387,14 +403,13 @@ impl ForgeStore {
         }
         let canon_root = normalize_canonical_path(raw_path)
             .with_context(|| format!("Failed to canonicalize workspace path: {}", req.path))?;
+        if !canon_root.is_dir() {
+            return Err(anyhow!("Workspace path is not a directory: {}", req.path));
+        }
 
         if !allowed_roots.is_empty() {
             let allowed = allowed_roots.iter().any(|ar| {
-                if let Ok(canon_ar) = normalize_canonical_path(ar) {
-                    canon_root.starts_with(&canon_ar)
-                } else {
-                    canon_root.starts_with(ar)
-                }
+                normalize_canonical_path(ar).is_ok_and(|canon_ar| canon_root.starts_with(canon_ar))
             });
             if !allowed {
                 return Err(anyhow!(
@@ -405,6 +420,7 @@ impl ForgeStore {
         }
 
         let root_str = canon_root.to_string_lossy().into_owned();
+        let root_path_hash = sha256_hex(root_str.as_bytes());
         let repo_name = canon_root
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -421,12 +437,12 @@ impl ForgeStore {
                     }
                 })
                 .collect();
-            let short_hash = &sha256_hex(root_str.as_bytes())[..8];
+            let short_hash = &root_path_hash[..8];
             format!("{}-{}", slug.trim_matches('-'), short_hash)
         });
 
-        let repository_id = format!("repo-{}", &sha256_hex(root_str.as_bytes())[..12]);
-        let now = Utc::now().to_rfc3339();
+        let repository_id = format!("repo-{}", &root_path_hash[..12]);
+        let now = timestamp_now();
 
         let (root_hash, file_records) = Self::compute_workspace_state(&canon_root)?;
 
@@ -934,7 +950,7 @@ impl ForgeStore {
                     JobStatusState::Completed.as_str(),
                     total_files as i64,
                     snapshot_id,
-                    Utc::now().to_rfc3339()
+                    timestamp_now()
                 ],
             )?;
             tx.commit()?;
@@ -1129,7 +1145,7 @@ impl ForgeStore {
     ) -> Result<ResponseEnvelope<WorkspaceStatusResult>> {
         let (ws, snap, freshness, changed_files) =
             self.check_workspace_freshness(&req.workspace_id)?;
-        let now = Utc::now().to_rfc3339();
+        let now = timestamp_now();
 
         let status_res = WorkspaceStatusResult {
             workspace_id: ws.workspace_id.clone(),
@@ -1271,7 +1287,7 @@ impl ForgeStore {
         })?;
 
         let truncated = all_matching.len() > limit;
-        let now = Utc::now().to_rfc3339();
+        let now = timestamp_now();
         let mut results = Vec::new();
         let mut evidence = Vec::new();
 
@@ -1352,7 +1368,7 @@ impl ForgeStore {
             None
         };
 
-        let now = Utc::now().to_rfc3339();
+        let now = timestamp_now();
         let evidence = vec![Evidence {
             repository_id: ws.repository_id,
             workspace_id: ws.workspace_id,
@@ -1534,7 +1550,7 @@ impl ForgeStore {
         }
 
         let truncated = refs.len() > limit;
-        let now = Utc::now().to_rfc3339();
+        let now = timestamp_now();
         let mut results = Vec::new();
         let mut evidence = Vec::new();
 
@@ -1950,7 +1966,7 @@ impl ForgeStore {
         snapshot_id: Option<String>,
         error: Option<String>,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
+        let now = timestamp_now();
         self.with_conn(|conn| {
             conn.execute(
                 r#"
@@ -2056,7 +2072,7 @@ impl ForgeStore {
                     Freshness::Current,
                 )
             };
-        let now = Utc::now().to_rfc3339();
+        let now = timestamp_now();
         let evidence = vec![Evidence {
             repository_id: format!("repo-{}", job.workspace_id),
             workspace_id: job.workspace_id.clone(),
@@ -2124,7 +2140,7 @@ impl ForgeStore {
             .snapshot_id
             .clone()
             .unwrap_or_else(|| "none".to_string());
-        let now = Utc::now().to_rfc3339();
+        let now = timestamp_now();
         let evidence = vec![Evidence {
             repository_id: format!("repo-{}", job.workspace_id),
             workspace_id: job.workspace_id.clone(),

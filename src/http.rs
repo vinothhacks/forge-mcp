@@ -1,8 +1,8 @@
 use crate::mcp::ForgeMcpServer;
 use anyhow::Result;
 use axum::{
-    extract::{Query, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{Request, State},
+    http::{header, uri::Authority, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -12,9 +12,8 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -39,10 +38,7 @@ pub fn build_http_router(mcp: Arc<ForgeMcpServer>, auth_token: Option<String>) -
         .route("/mcp", post(handle_mcp_post))
         .route("/message", post(handle_mcp_post))
         .route("/sse", get(handle_sse_get))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            bearer_auth_middleware,
-        ));
+        .route_layer(middleware::from_fn_with_state(state.clone(), protect_mcp));
 
     Router::new()
         .route("/health", get(handle_health))
@@ -82,27 +78,54 @@ async fn handle_health() -> impl IntoResponse {
     )
 }
 
-async fn bearer_auth_middleware(
-    State(state): State<HttpAppState>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-    request: Request,
-    next: Next,
-) -> Response {
+fn is_loopback_authority(authority: &Authority) -> bool {
+    let host = authority.host();
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+async fn protect_mcp(State(state): State<HttpAppState>, request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let authority = request.uri().authority().cloned().or_else(|| {
+        headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok()?.parse::<Authority>().ok())
+    });
+
+    // Restrict browser requests to the local server's origin. Also check Host
+    // without authentication so DNS rebinding cannot reach the legacy SSE route.
+    let loopback_host = authority.as_ref().is_some_and(is_loopback_authority);
+    if state.auth_token.is_none() && !loopback_host {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    if let Some(origin) = origins.next() {
+        let same_origin = loopback_host
+            && origin.to_str().ok().is_some_and(|value| {
+                value
+                    .strip_prefix("http://")
+                    .or_else(|| value.strip_prefix("https://"))
+                    .zip(authority.as_ref())
+                    .is_some_and(|(origin, host)| origin.eq_ignore_ascii_case(host.as_str()))
+            });
+        if !same_origin || origins.next().is_some() {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+
     if let Some(ref expected) = state.auth_token {
         let header_token = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| {
-                s.strip_prefix("Bearer ")
-                    .or_else(|| s.strip_prefix("bearer "))
-            })
-            .map(|s| s.trim());
+            .and_then(|value| value.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+            .map(|(_, token)| token.trim());
 
-        let query_token = query.get("token").map(|s| s.as_str());
-        let provided = header_token.or(query_token);
-
-        match provided {
+        match header_token {
             Some(tok) if tok == expected => {}
             _ => {
                 return (
@@ -128,17 +151,15 @@ async fn handle_mcp_post(
     State(state): State<HttpAppState>,
     Json(payload): Json<Value>,
 ) -> Response {
-    let mcp = state.mcp.clone();
-    let sse_tx = state.sse_tx.clone();
-
+    let HttpAppState { mcp, sse_tx, .. } = state;
     let resp_opt = tokio::task::spawn_blocking(move || mcp.handle_jsonrpc_value(payload))
         .await
         .unwrap_or(None);
 
     match resp_opt {
         Some(resp_val) => {
-            if let Ok(text) = serde_json::to_string(&resp_val) {
-                let _ = sse_tx.send(text);
+            if sse_tx.receiver_count() > 0 {
+                let _ = sse_tx.send(resp_val.to_string());
             }
             (StatusCode::OK, Json(resp_val)).into_response()
         }

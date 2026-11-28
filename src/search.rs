@@ -2,7 +2,6 @@ use crate::embeddings::{cosine_similarity, split_code_tokens, EmbeddingEngine};
 use crate::model::*;
 use crate::store::ForgeStore;
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 
@@ -283,7 +282,7 @@ pub fn code_search(
     });
 
     let truncated = hits.len() > limit;
-    let now = Utc::now().to_rfc3339();
+    let now = timestamp_now();
     let mut results = Vec::new();
     let mut evidence = Vec::new();
 
@@ -432,7 +431,7 @@ pub fn context_build(
     let mut primary_matches = 0usize;
     let mut graph_expanded_items = 0usize;
     let mut budget_truncated = false;
-    let now = Utc::now().to_rfc3339();
+    let now = timestamp_now();
 
     // Pass 1: Seed with top primary hits (up to 2) and queue their 1-hop graph neighbors
     let seed_count = 2.min(search_env.results.len());
