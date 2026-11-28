@@ -1,6 +1,6 @@
 use forge_mcp::embeddings::EmbeddingEngine;
 use forge_mcp::graph::{graph_query, impact_analyze};
-use forge_mcp::http::build_http_router;
+use forge_mcp::http::{build_http_router, run_http_server};
 use forge_mcp::mcp::ForgeMcpServer;
 use forge_mcp::model::*;
 use forge_mcp::search::{code_search, context_build};
@@ -1108,6 +1108,30 @@ fn test_stdio_jsonrpc_e2e_subprocess() {
     drop(stdin);
     let status = child.wait().expect("wait for child exit");
     assert!(status.success());
+}
+
+#[tokio::test]
+async fn test_http_off_loopback_requires_nonblank_token() {
+    let store = ForgeStore::open_in_memory().expect("open store");
+    let mcp = Arc::new(ForgeMcpServer::new(
+        store,
+        EmbeddingEngine::default(),
+        vec![],
+    ));
+
+    for token in [None, Some(String::new()), Some(" \t".to_owned())] {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_http_server(mcp.clone(), "192.0.2.1", 0, token),
+        )
+        .await
+        .expect("the guard should reject promptly");
+        let error = result.expect_err("off-loopback bind should be refused");
+        assert!(
+            error.to_string().contains("Set FORGE_AUTH_TOKEN"),
+            "{error}"
+        );
+    }
 }
 
 #[tokio::test]
