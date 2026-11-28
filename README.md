@@ -148,6 +148,10 @@ forge-mcp --transport http --host 127.0.0.1 --port 8080 \
 | `GET /sse` + `POST /message` | Legacy SSE transport |
 | `GET /health` | Liveness check, no auth |
 
+On the current source build, send the token in the `Authorization` header and keep it out of URLs.
+For requests with an `Origin` header, Forge requires a loopback origin with the request's host
+and port. Tokenless MCP requests must also use a loopback host such as `127.0.0.1` or `localhost`.
+
 Connect Claude Code to it:
 
 ```bash

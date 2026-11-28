@@ -18,6 +18,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const root = process.argv[2];
 const server = http.createServer((req, res) => {
+  // The synchronous resolver can stall the client past the server's idle timeout.
+  res.setHeader('Connection', 'close');
   const rel = decodeURIComponent(req.url.split('?')[0]).replace(/^\\/+/, '');
   const file = path.join(root, rel);
   if (!file.startsWith(root) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {

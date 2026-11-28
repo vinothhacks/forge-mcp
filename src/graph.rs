@@ -2,7 +2,6 @@ use crate::model::*;
 use crate::search::is_test_path_or_symbol;
 use crate::store::ForgeStore;
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Execute bounded BFS/DFS relationship queries (`callers`, `callees`, `imports`, `importers`, `children`, `implements`, `path`).
@@ -232,7 +231,7 @@ pub fn graph_query(
     let truncated = hops.len() > limit;
     hops.truncate(limit);
 
-    let now = Utc::now().to_rfc3339();
+    let now = timestamp_now();
     let mut evidence = Vec::new();
     let mut unresolved_count = 0usize;
 
@@ -590,7 +589,7 @@ pub fn impact_analyze(
 
     let mut max_depth_reached = 0usize;
     let mut evidence = Vec::new();
-    let now = Utc::now().to_rfc3339();
+    let now = timestamp_now();
 
     for distance in 1..=max_depth {
         let mut next_ids = HashSet::new();

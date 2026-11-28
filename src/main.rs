@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "forge-mcp",
     version,
@@ -28,7 +28,7 @@ pub struct Cli {
     pub port: u16,
 
     /// Optional Bearer authentication token for HTTP mode
-    #[arg(long, env = "FORGE_AUTH_TOKEN")]
+    #[arg(long, env = "FORGE_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<String>,
 
     /// Allowed workspace root directory (can be specified multiple times)
